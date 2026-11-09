@@ -8,7 +8,7 @@ import { firebaseConfig } from './firebase-config.js';
 
 const fb = initializeApp(firebaseConfig);
 const auth = getAuth(fb);
-const db = initializeFirestore(fb, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
+const db = initializeFirestore(fb, { experimentalAutoDetectLongPolling: true, localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
 
 // ---------- catalog ----------
 const DEFAULT_CATALOG = {
@@ -262,9 +262,15 @@ async function statusPage(eventId, orderId) {
     const c = document.getElementById('copy');
     if (c) c.onclick = () => (navigator.clipboard?.writeText(link) || Promise.reject()).then(() => toast('Link copied')).catch(() => toast(link));
   }
-  unsubs.push(onSnapshot(doc(db, 'events', eventId, 'orders', orderId), { includeMetadataChanges: true }, s => {
-    connected = !s.metadata.fromCache; order = s.exists() ? s.data({ serverTimestamps: 'estimate' }) : null; render();
-  }, () => render()));
+  let stopOrder = null;
+  const listen = () => {
+    if (stopOrder) stopOrder();
+    stopOrder = onSnapshot(doc(db, 'events', eventId, 'orders', orderId), { includeMetadataChanges: true }, s => {
+      connected = !s.metadata.fromCache; order = s.exists() ? s.data({ serverTimestamps: 'estimate' }) : null; render();
+    }, () => render());
+  };
+  listen();
+  unsubs.push(() => stopOrder && stopOrder());
   unsubs.push(onSnapshot(doc(db, 'events', eventId, 'public', 'queue'), s => { queue = s.exists() ? (s.data().ids || []) : null; render(); }, () => {}));
   // Phones pause live connections in the background; re-check straight from the server when the page
   // comes back on screen and every 15s until the piece is ready, so the status can't get stuck.
@@ -277,10 +283,12 @@ async function statusPage(eventId, orderId) {
       connected = true; render();
     } catch (e) { connected = false; render(); }
   }
-  const vis = () => { if (document.visibilityState === 'visible') refresh(); };
+  const vis = () => { if (document.visibilityState === 'visible') { listen(); refresh(); } };
   document.addEventListener('visibilitychange', vis); addEventListener('focus', vis); addEventListener('pageshow', vis);
   unsubs.push(() => { document.removeEventListener('visibilitychange', vis); removeEventListener('focus', vis); removeEventListener('pageshow', vis); });
-  timers.push(setInterval(refresh, 15000));
+  // While someone is working on it, check every 4s (ready is close); while queued, every 15s.
+  let tick = 0;
+  timers.push(setInterval(() => { tick++; if (order?.status === 'progress' || tick % 4 === 0) refresh(); }, 4000));
   render();
 }
 
