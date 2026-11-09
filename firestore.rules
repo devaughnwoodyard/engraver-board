@@ -1,0 +1,45 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Staff = signed in with Google, verified email, and listed in /staff/{email}.
+    // /staff docs are managed in the Firebase console only.
+    function isStaff() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && exists(/databases/$(database)/documents/staff/$(request.auth.token.email));
+    }
+
+    match /staff/{email} {
+      allow read: if request.auth != null && request.auth.token.email == email;
+      allow write: if false;
+    }
+
+    // Event setup (items, options, engravers): public read so the guest form can render.
+    match /events/{eventId} {
+      allow read: if true;
+      allow write: if isStaff();
+
+      // Public queue snapshot the board maintains, so guests can see their position.
+      match /public/{docId} {
+        allow read: if true;
+        allow write: if isStaff();
+      }
+
+      match /orders/{orderId} {
+        // Guests: create one order as themselves, landing in the queue.
+        allow create: if request.auth != null
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.status == 'queue'
+          && request.resource.data.engraver == null
+          && request.resource.data.name is string
+          && request.resource.data.name.size() <= 40;
+        // Guests read only their own order; staff read everything.
+        allow read: if isStaff()
+          || (request.auth != null && resource.data.uid == request.auth.uid);
+        // Only staff move or remove cards.
+        allow update, delete: if isStaff();
+      }
+    }
+  }
+}
