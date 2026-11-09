@@ -173,7 +173,10 @@ legend{font:400 1.3125rem var(--display);color:var(--ink);text-align:center;widt
 .free b{font:400 1.25rem var(--display);color:var(--char);display:block}
 .drop.zone:has(.now) .free{display:none}
 details.eng{border-top:1px solid var(--line);padding-top:6px;font-size:.875rem;color:var(--muted)}
-details.eng summary{min-height:40px;display:flex;align-items:center;cursor:pointer}
+details.eng summary{min-height:44px;display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;font-weight:700;color:var(--ink)}
+details.eng summary::-webkit-details-marker{display:none}
+details.eng summary::before{content:'';width:0;height:0;border-left:7px solid var(--ink);border-top:5px solid transparent;border-bottom:5px solid transparent;transition:transform .15s}
+details.eng[open] summary::before{transform:rotate(90deg)}
 details.eng li{padding:4px 0;color:var(--char)}
 details.eng ul{list-style:none;padding:0;margin:0}
 .sortable-ghost{opacity:.35}
