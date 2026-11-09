@@ -98,8 +98,12 @@
 </svg>`;
   }
 
+  // Each inline SVG needs its own gradient/filter ids, or every copy on a page borrows the first one's colors.
+  let seq = 0;
   function renderPreview(opts) {
-    return opts.item === 'tumbler' ? tumbler(opts) : bagTag(opts);
+    const svg = opts.item === 'tumbler' ? tumbler(opts) : bagTag(opts);
+    const u = 'p' + (++seq) + '_';
+    return svg.replace(/id="([\w-]+)"/g, 'id="' + u + '$1"').replace(/url\(#([\w-]+)\)/g, 'url(#' + u + '$1)');
   }
   const api = { renderPreview, LEATHER, TUMBLER };
   if (typeof module !== 'undefined') module.exports = api; else root.EngravePreview = api;
