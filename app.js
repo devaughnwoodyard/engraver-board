@@ -303,6 +303,28 @@ async function boardPage(eventId) {
   render();
 }
 
+// ---------- export ----------
+const tsDate = t => (t && typeof t.toDate === 'function') ? t.toDate() : null;
+const fmtStamp = d => d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : '';
+const mins = (a, b) => (a && b && b >= a) ? Math.round((b - a) / 6000) / 10 : '';
+async function exportOrders(eventId, ev) {
+  const snap = await getDocs(query(collection(db, 'events', eventId, 'orders'), orderBy('createdAt')));
+  const head = ['Order #', 'Name', 'Service', 'Item', 'Finish', 'Detail', 'Lettering', 'Submitted', 'Handled by', 'Started', 'Finished', 'Wait in queue (min)', 'Time to make (min)', 'Total (min)', 'Status'];
+  const rows = snap.docs.map(d => {
+    const o = d.data(); const it = itemDef(ev, o.item) || { label: o.item, colors: {}, addons: {} };
+    const sub = tsDate(o.createdAt), st = tsDate(o.startedAt), dn = o.status === 'done' ? tsDate(o.doneAt) : null;
+    return [shortId(d.id), o.name, catalog(ev)[o.service]?.label || o.service || '', it.label, it.colors[o.color] || o.color || '', it.addons[o.addon] || o.addon || '',
+      FONTS[o.font] || o.font || '', fmtStamp(sub), o.engraver || '', fmtStamp(st), fmtStamp(dn), mins(sub, st), mins(st, dn), mins(sub, dn),
+      { queue: 'Waiting', progress: 'In progress', done: 'Done' }[o.status] || o.status];
+  });
+  const cell = v => { const t = String(v ?? ''); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+  const csv = '\ufeff' + [head, ...rows].map(r => r.map(cell).join(',')).join('\r\n');
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  const link = document.createElement('a'); link.href = url; link.download = `${eventId}-orders.csv`; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  toast(`${rows.length} orders exported. In Google Sheets: File → Import → Upload.`);
+}
+
 // ---------- admin ----------
 async function adminPage() {
   const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
@@ -334,7 +356,7 @@ async function adminPage() {
           <div class="qr" data-url="${esc(url)}"></div>
           <div class="info">
             <h2>${esc(ev.name)}</h2><div class="muted">${esc(fmtDate(ev.date))} · ${(ev.engravers || []).map(esc).join(', ')}${ev.open === false ? ' · closed' : ''}</div>
-            <div class="links"><a href="#/board/${encodeURIComponent(ev.id)}">Open board</a><a href="#/e/${encodeURIComponent(ev.id)}">Guest form</a><a href="#" data-copy="${esc(url)}">Copy guest link</a><a href="#" data-qr="${esc(ev.id)}">Download QR</a></div>
+            <div class="links"><a href="#/board/${encodeURIComponent(ev.id)}">Open board</a><a href="#/e/${encodeURIComponent(ev.id)}">Guest form</a><a href="#" data-copy="${esc(url)}">Copy guest link</a><a href="#" data-qr="${esc(ev.id)}">Download QR</a><a href="#" data-export="${esc(ev.id)}">Export orders (Sheets)</a></div>
             <details><summary class="label" style="cursor:pointer;min-height:44px;display:flex;align-items:center">Edit</summary>
               <div class="field"><label class="label">Engravers</label><input name="eng" value="${esc((ev.engravers || []).join(', '))}"></div>
               <div class="field"><span class="label">Items offered</span><div class="checks">${itemChecks(ev)}</div></div>
@@ -357,6 +379,11 @@ async function adminPage() {
       e.preventDefault();
       const box = a.closest('.event'); const q = qrcode(0, 'M'); q.addData(box.querySelector('.qr').dataset.url); q.make();
       const link = document.createElement('a'); link.href = q.createDataURL(12, 4); link.download = `qr-${a.dataset.qr}.gif`; link.click();
+    });
+    $app.querySelectorAll('[data-export]').forEach(a => a.onclick = async e => {
+      e.preventDefault();
+      const id = a.dataset.export; const ev = evs.find(x => x.id === id);
+      try { await exportOrders(id, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); }
     });
     document.getElementById('new').onsubmit = async e => {
       e.preventDefault();
