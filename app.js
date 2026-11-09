@@ -174,7 +174,7 @@ async function guestForm(eventId) {
         <div class="proof"><span class="ph">${previewHTML(ev, st)}</span>
           <dl class="rows"><div><dt>Name</dt><dd><b style="font-size:1.125rem">${esc(st.name.trim())}</b></dd></div><div><dt>Piece</dt><dd>${esc(it.label)}</dd></div>
           <div><dt>Details</dt><dd>${esc(it.colors[st.color])} • ${esc(it.addons[st.addon])} • ${esc(FONTS[st.font])}</dd></div>
-          <div><dt>Spelled right?</dt><dd><button class="linkbtn" id="edit" type="button">Edit</button></dd></div></dl></div>
+          </dl><div class="spell"><span>Spelled right?</span><button class="editbtn" id="edit" type="button">✎ Edit</button></div></div>
         <p class="err" id="err" role="alert"></p>`;
       bar = `<button class="btn sec" id="back" type="button">Back</button><button class="btn" id="send" type="button" ${st.sending ? 'disabled' : ''}>${st.sending ? 'Sending…' : 'Send for engraving'}</button>`;
     }
