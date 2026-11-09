@@ -288,21 +288,23 @@ async function statusPage(eventId, orderId) {
   }, () => {}));
   // Phones pause live connections in the background; re-check straight from the server when the page
   // comes back on screen and every 15s until the piece is ready, so the status can't get stuck.
-  async function refresh() {
-    if (order && (order.status === 'done' || order.status === 'picked') ) return;
+  async function refresh(full = true) {
+    if (order && (order.status === 'done' || order.status === 'picked')) return;
     try {
-      const [o, q] = await Promise.all([getDocFromServer(doc(db, 'events', eventId, 'orders', orderId)), getDocFromServer(doc(db, 'events', eventId, 'public', 'queue')).catch(() => null)]);
-      if (o.exists()) order = o.data({ serverTimestamps: 'estimate' });
-      if (q && q.exists()) queue = q.data().ids || [];
+      const q = await getDocFromServer(doc(db, 'events', eventId, 'public', 'queue')).catch(() => null);
+      if (q) queue = q.exists() ? (q.data().ids || []) : [];
+      if (full || !order) { const o = await getDocFromServer(doc(db, 'events', eventId, 'orders', orderId)); if (o.exists()) order = o.data({ serverTimestamps: 'estimate' }); }
       connected = true; render();
     } catch (e) { connected = false; render(); }
   }
   const vis = () => { if (document.visibilityState === 'visible') { listen(); refresh(); } };
   document.addEventListener('visibilitychange', vis); addEventListener('focus', vis); addEventListener('pageshow', vis);
   unsubs.push(() => { document.removeEventListener('visibilitychange', vis); removeEventListener('focus', vis); removeEventListener('pageshow', vis); });
-  // While someone is working on it, check every 4s (ready is close); while queued, every 15s.
+  // Live listeners usually win, but phones can be slow to open them. Fetch right away, then
+  // re-check the line every 5s and the order itself every 10s until the piece is ready.
+  refresh();
   let tick = 0;
-  timers.push(setInterval(() => { tick++; if (order?.status === 'progress' || tick % 4 === 0) refresh(); }, 4000));
+  timers.push(setInterval(() => { tick++; refresh(tick % 2 === 0); }, 5000));
   render();
 }
 
