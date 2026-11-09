@@ -1,6 +1,6 @@
 // App-shell cache so the board and forms open without a connection after the first visit.
 // Firestore traffic is never intercepted; the Firebase SDK handles offline data itself.
-const CACHE = 'eb-v5';
+const CACHE = 'eb-v6';
 const SHELL = ['./', './index.html', './app.js', './preview.js', './firebase-config.js', './manifest.webmanifest', './icon.svg', './logo.png'];
 const CDN = ['www.gstatic.com', 'cdnjs.cloudflare.com', 'fonts.googleapis.com', 'fonts.gstatic.com'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });

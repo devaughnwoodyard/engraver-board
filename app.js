@@ -12,7 +12,9 @@ const auth = getAuth(fb);
 // Guest pages use an in-memory cache: a direct live connection with no cross-tab relay, so updates land in about a second.
 const staffView = /^#\/(board|admin)/.test(location.hash);
 const db = initializeFirestore(fb, {
-  experimentalAutoDetectLongPolling: true,
+  // Long-polling instead of a streaming connection: venue Wi-Fi, proxies and some phone/browser filters
+  // buffer streams, which delays live updates by many seconds.
+  experimentalForceLongPolling: true,
   localCache: staffView ? persistentLocalCache({ tabManager: persistentSingleTabManager({ forceOwnership: true }) }) : memoryLocalCache()
 });
 
@@ -228,7 +230,8 @@ async function statusPage(eventId, orderId) {
   $app.innerHTML = `<div class="page"><p class="note" style="padding:40px">Loading…</p></div>`;
   await ensureGuest();
   let ev = null, order = null, queue = null, connected = true, lastSig = '';
-  try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
+  // Don't hold the page on the event details; the order itself is what the guest is waiting for.
+  getDoc(doc(db, 'events', eventId)).then(s => { ev = s.exists() ? s.data() : null; render(); }).catch(() => {});
   const link = `${baseUrl()}#/o/${encodeURIComponent(eventId)}/${orderId}`;
 
   function aheadText(n) { return n === 0 ? "you're next" : `${n} ${n === 1 ? 'piece' : 'pieces'} ahead of yours`; }
