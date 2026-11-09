@@ -257,7 +257,7 @@ async function statusPage(eventId, orderId) {
       const state = s === 'progress'
         ? `<div class="eyebrow">it's happening</div><h1>${esc(order.engraver || 'we')} ${order.engraver ? 'is' : 'are'} <em>${order.service === 'calligraphy' ? 'lettering' : 'engraving'}</em> yours</h1>`
         : (pos >= 0 ? `<div class="eyebrow">you're in line</div>${pos === 0 ? `<h1>you're <em>next</em></h1>` : `<div class="big" aria-hidden="true">${pos}</div><h1 style="font-size:1.5rem;margin-top:4px" aria-hidden="true">${pos === 1 ? 'piece' : 'pieces'} ahead of <em>yours</em></h1><p class="note" style="margin-top:6px">you're #${pos + 1} in line</p>`}`
-          : `<div class="eyebrow">you're in line</div><h1>we've got <em>yours</em></h1>`);
+          : `<div class="eyebrow">you're in line</div><h1>${queue === null ? 'finding your <em>place</em>…' : `we've got <em>yours</em>`}</h1>`);
       html = `<header class="band">${LOGO}<div class="ev">order ${shortId(orderId)}</div>${WAVE(390)}</header>
         <main class="content"><div class="state">${state}</div>
         <p class="vh" role="status" aria-atomic="true" id="announce"></p>
@@ -280,7 +280,12 @@ async function statusPage(eventId, orderId) {
   };
   listen();
   unsubs.push(() => stopOrder && stopOrder());
-  unsubs.push(onSnapshot(doc(db, 'events', eventId, 'public', 'queue'), s => { queue = s.exists() ? (s.data().ids || []) : null; render(); }, () => {}));
+  // Only trust the line once it comes from the server. Right after submitting, the phone's own pending
+  // write makes the line look like it holds just this order, which would wrongly say "you're next".
+  unsubs.push(onSnapshot(doc(db, 'events', eventId, 'public', 'queue'), { includeMetadataChanges: true }, s => {
+    if (s.metadata.hasPendingWrites || s.metadata.fromCache) return;
+    queue = s.exists() ? (s.data().ids || []) : []; render();
+  }, () => {}));
   // Phones pause live connections in the background; re-check straight from the server when the page
   // comes back on screen and every 15s until the piece is ready, so the status can't get stuck.
   async function refresh() {
