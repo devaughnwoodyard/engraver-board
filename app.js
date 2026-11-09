@@ -2,7 +2,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/fireba
 import { getAuth, signInAnonymously, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  doc, collection, setDoc, updateDoc, getDoc, getDocs, onSnapshot, query, orderBy, serverTimestamp
+  doc, collection, setDoc, updateDoc, getDoc, getDocs, onSnapshot, query, orderBy, serverTimestamp, writeBatch, arrayUnion, getDocFromServer
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { firebaseConfig } from './firebase-config.js';
 
@@ -205,7 +205,12 @@ async function guestForm(eventId) {
     // The order id is fixed for this form visit, so a retry overwrites the same order instead of creating a second one.
     const ref = doc(db, 'events', eventId, 'orders', submitKey);
     const data = { uid: user.uid, service: st.svc, item: st.item, color: st.color, addon: st.addon, font: st.font, name, status: 'queue', engraver: null, createdAt: serverTimestamp(), clientAt: Date.now() };
-    setDoc(ref, data).catch(e => toast('Could not send: ' + (e.code || e.message)));
+    // One batch: create the order and add it to the bottom of the public line, so the guest's
+    // "pieces ahead" count works even when no board is open.
+    const batch = writeBatch(db);
+    batch.set(ref, data);
+    batch.set(doc(db, 'events', eventId, 'public', 'queue'), { ids: arrayUnion(ref.id), updatedAt: serverTimestamp() }, { merge: true });
+    batch.commit().catch(() => setDoc(ref, data).catch(e => toast('Could not send: ' + (e.code || e.message))));
     rememberOrder(eventId, { id: ref.id, name });
     location.hash = `#/o/${encodeURIComponent(eventId)}/${ref.id}`;
   }
@@ -225,8 +230,8 @@ async function statusPage(eventId, orderId) {
     if (!order) { $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">order ${shortId(orderId)}</div>${WAVE(390)}</header><main class="content"><h1>looking for your <em>order</em></h1><p class="note">If this doesn't change in a few seconds, it may have been placed on a different phone. Ask at the engraving table with your name.</p><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Back to the form</a></main></div>`; return; }
     const s = order.status, pos = queue ? queue.indexOf(orderId) : -1;
     const sig = s + '|' + pos + '|' + (order.engraver || '');
-    const steps = ['received', 'in line', order.service === 'calligraphy' ? 'lettering' : 'engraving', 'ready'];
-    const curIdx = { queue: 1, progress: 2, done: 3, picked: 3 }[s] ?? 1;
+    const steps = ['in line', order.service === 'calligraphy' ? 'being lettered' : 'being engraved', 'ready'];
+    const curIdx = { queue: 0, progress: 1, done: 2, picked: 2 }[s] ?? 0;
     const miles = `<ol class="miles">${steps.map((t, i) => `<li class="${i < curIdx || s === 'picked' ? 'dn' : ''}" ${i === curIdx && s !== 'picked' ? 'aria-current="step"' : ''}><b aria-hidden="true"></b>${t}</li>`).join('')}</ol>`;
     const item = `<div class="mini"><span class="ph">${previewHTML(ev, order)}</span><div><div class="nm">${esc(order.name)}</div><div class="ds">${esc(describe(ev, order, true))}<br>${esc((FONTS[order.font] || '').toLowerCase())}</div></div></div>`;
     const live = `<div class="live ${connected ? '' : 'off'}"><i aria-hidden="true"></i>${connected ? 'Live • updates on its own' : 'Reconnecting… your order is safe'}</div>`;
@@ -242,7 +247,7 @@ async function statusPage(eventId, orderId) {
     } else {
       const state = s === 'progress'
         ? `<div class="eyebrow">it's happening</div><h1>${esc(order.engraver || 'we')} ${order.engraver ? 'is' : 'are'} <em>${order.service === 'calligraphy' ? 'lettering' : 'engraving'}</em> yours</h1>`
-        : (pos >= 0 ? `<div class="eyebrow">you're in line</div>${pos === 0 ? `<h1>you're <em>next</em></h1>` : `<div class="big" aria-hidden="true">${pos}</div><h1 style="font-size:1.5rem;margin-top:4px" aria-hidden="true">${pos === 1 ? 'piece' : 'pieces'} ahead of <em>yours</em></h1>`}`
+        : (pos >= 0 ? `<div class="eyebrow">you're in line</div>${pos === 0 ? `<h1>you're <em>next</em></h1>` : `<div class="big" aria-hidden="true">${pos}</div><h1 style="font-size:1.5rem;margin-top:4px" aria-hidden="true">${pos === 1 ? 'piece' : 'pieces'} ahead of <em>yours</em></h1><p class="note" style="margin-top:6px">you're #${pos + 1} in line</p>`}`
           : `<div class="eyebrow">you're in line</div><h1>we've got <em>yours</em></h1>`);
       html = `<header class="band">${LOGO}<div class="ev">order ${shortId(orderId)}</div>${WAVE(390)}</header>
         <main class="content"><div class="state">${state}</div>
@@ -261,6 +266,21 @@ async function statusPage(eventId, orderId) {
     connected = !s.metadata.fromCache; order = s.exists() ? s.data({ serverTimestamps: 'estimate' }) : null; render();
   }, () => render()));
   unsubs.push(onSnapshot(doc(db, 'events', eventId, 'public', 'queue'), s => { queue = s.exists() ? (s.data().ids || []) : null; render(); }, () => {}));
+  // Phones pause live connections in the background; re-check straight from the server when the page
+  // comes back on screen and every 15s until the piece is ready, so the status can't get stuck.
+  async function refresh() {
+    if (order && (order.status === 'done' || order.status === 'picked') ) return;
+    try {
+      const [o, q] = await Promise.all([getDocFromServer(doc(db, 'events', eventId, 'orders', orderId)), getDocFromServer(doc(db, 'events', eventId, 'public', 'queue')).catch(() => null)]);
+      if (o.exists()) order = o.data({ serverTimestamps: 'estimate' });
+      if (q && q.exists()) queue = q.data().ids || [];
+      connected = true; render();
+    } catch (e) { connected = false; render(); }
+  }
+  const vis = () => { if (document.visibilityState === 'visible') refresh(); };
+  document.addEventListener('visibilitychange', vis); addEventListener('focus', vis); addEventListener('pageshow', vis);
+  unsubs.push(() => { document.removeEventListener('visibilitychange', vis); removeEventListener('focus', vis); removeEventListener('pageshow', vis); });
+  timers.push(setInterval(refresh, 15000));
   render();
 }
 
@@ -288,12 +308,12 @@ async function boardPage(eventId) {
   const mins = o => { const d = tsDate(o.createdAt) || tsDate(o.clientAt); return d ? Math.max(0, Math.round((Date.now() - d) / 60000)) : 0; };
   const pendChip = o => o.pending ? `<div class="pend">${online() ? 'Saving…' : 'Offline • move pending'}</div>` : '';
 
-  function queueCard(o, free) {
+  function queueCard(o, free, i) {
     const m = mins(o);
     const action = free.length === 0 ? `<button class="go" type="button" disabled>All engravers busy</button>`
       : free.length === 1 ? `<button class="go" type="button" data-start="${o.id}" data-who="${esc(free[0])}">Start with ${esc(free[0])}</button>`
       : `<button class="go" type="button" data-pick="${o.id}" aria-expanded="${openWho === o.id}">Start ▾</button>`;
-    return `<div class="qc" data-id="${o.id}"><span class="ph">${previewHTML(ev, o)}</span><div class="nm">${esc(o.name)}</div><div class="ds">#${shortId(o.id)} • ${esc(describe(ev, o, true))} • ${esc((FONTS[o.font] || '').toLowerCase())}</div>
+    return `<div class="qc" data-id="${o.id}"><span class="ph">${previewHTML(ev, o)}</span><div class="nm"><span class="pos" aria-label="Position ${i + 1}">${i + 1}</span>${esc(o.name)}</div><div class="ds">#${shortId(o.id)} • ${esc(describe(ev, o, true))} • ${esc((FONTS[o.font] || '').toLowerCase())}</div>
       <div class="ft"><span class="age ${m >= 10 ? 'hot' : ''}">waiting ${m} min</span>${action}</div>
       ${openWho === o.id ? `<div class="who">${free.map(e => `<button type="button" data-start="${o.id}" data-who="${esc(e)}">${esc(e)}</button>`).join('')}</div>` : ''}${pendChip(o)}</div>`;
   }
@@ -316,8 +336,8 @@ async function boardPage(eventId) {
           <span class="lv ${online() ? '' : 'off'}"><i aria-hidden="true"></i>${online() ? 'Live' : 'Offline • moves save on this iPad'}</span>
           <a href="#/admin">events</a></div>${WAVE(1180)}</header>
       <main class="lanes" style="--n:${engravers().length}">
-        <section class="lane" aria-label="Queue"><h2>queue <small>oldest first</small></h2>
-          <div class="drop" data-status="queue" data-engraver="">${q.map(o => queueCard(o, free)).join('') || '<p class="note">No one waiting.</p>'}</div></section>
+        <section class="lane" aria-label="Queue"><h2>queue <small>first in line at the top</small></h2>
+          <div class="drop" data-status="queue" data-engraver="">${q.map((o, i) => queueCard(o, free, i)).join('') || '<p class="note">No one waiting.</p>'}</div></section>
         ${engravers().map(e => { const w = working(e); const made = orders.filter(o => (o.status === 'done' || o.status === 'picked') && o.engraver === e);
           return `<section class="lane" aria-label="${esc(e)}"><h2>${esc(e.toLowerCase())} <small>${made.length} engraved</small></h2>
             <div class="drop zone" data-status="progress" data-engraver="${esc(e)}">${w ? nowCard(w) : `<div class="free"><div><b>free</b>tap Start on a queue card<br>or drag one here</div></div>`}</div>
@@ -416,7 +436,7 @@ async function adminPage() {
         <form id="new">
           <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
           <div class="field"><label class="lbl" for="n-date">Date</label><input id="n-date" type="date" required></div>
-          <div class="field"><label class="lbl" for="n-eng">Engravers (comma separated)</label><input id="n-eng" value="Steph"></div>
+          <div class="field"><label class="lbl" for="n-eng">Engravers (comma separated)</label><input id="n-eng" value="Steph, Veronica, Christina, DeVaughn"></div>
           <div class="field"><label class="lbl" for="n-pick">Where guests pick up</label><input id="n-pick" value="at the engraving table"></div>
           <div class="field"><span class="lbl">Items offered</span><div class="checks">${itemChecks(null)}</div></div>
           <button class="btn" style="width:100%">Create event</button>

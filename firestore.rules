@@ -24,6 +24,12 @@ service cloud.firestore {
       match /public/{docId} {
         allow read: if true;
         allow write: if isStaff();
+        // A guest may add only their own new order to the bottom of the line, in the same batch that creates it.
+        allow create, update: if docId == 'queue' && request.auth != null
+          && request.resource.data.keys().hasOnly(['ids', 'updatedAt'])
+          && request.resource.data.ids.size() == (resource == null ? 0 : resource.data.ids.size()) + 1
+          && (resource == null || request.resource.data.ids.hasAll(resource.data.ids))
+          && getAfter(/databases/$(database)/documents/events/$(eventId)/orders/$(request.resource.data.ids[request.resource.data.ids.size() - 1])).data.uid == request.auth.uid;
       }
 
       match /orders/{orderId} {
