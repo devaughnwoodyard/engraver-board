@@ -19,16 +19,23 @@ const db = initializeFirestore(fb, {
 });
 
 // ---------- catalog ----------
-const DEFAULT_CATALOG = {
-  engraving: {
-    label: 'Engraving',
-    items: {
-      bagtag: { label: 'Leather bag tag', material: 'leather', finishLabel: 'leather', colors: { black: 'Black', tan: 'Tan', blush: 'Blush' }, addons: { none: 'Name only', stars: 'Stars', heart: 'Heart' } },
-      tumbler: { label: 'Tumbler', material: 'stainless steel', finishLabel: 'finish', colors: { black: 'Black', white: 'White', terracotta: 'Terracotta' }, addons: { none: 'Name only', stars: 'Stars', heart: 'Heart' } }
-    }
-  },
-  calligraphy: { label: 'Calligraphy', items: {} }
-};
+// One shared catalog in /config/catalog: categories → pieces → option groups → choices.
+// Each event turns pieces and single choices on or off. Ids never change once made, so
+// old orders and photos keep matching when a label is renamed.
+const DETAIL = () => ({ id: 'addon', label: 'Detail', choices: [{ id: 'none', label: 'Name only' }, { id: 'stars', label: 'Stars' }, { id: 'heart', label: 'Heart' }] });
+const DEFAULT_CATALOG = { categories: [
+  { id: 'engraving', label: 'Engraving', items: [
+    { id: 'bagtag', label: 'Leather bag tag', material: 'leather', preview: 'bagtag', groups: [
+      { id: 'color', label: 'Leather', swatch: true, choices: [{ id: 'black', label: 'Black', color: '#1d1b1a' }, { id: 'tan', label: 'Tan', color: '#a86b43' }, { id: 'blush', label: 'Blush', color: '#d9aa98' }] }, DETAIL()] },
+    { id: 'tumbler', label: 'Tumbler', material: 'stainless steel', preview: 'tumbler', groups: [
+      { id: 'color', label: 'Finish', swatch: true, choices: [{ id: 'black', label: 'Black', color: '#1d1b1a' }, { id: 'white', label: 'White', color: '#efece6' }, { id: 'terracotta', label: 'Terracotta', color: '#b9623f' }] }, DETAIL()] }] },
+  { id: 'calligraphy', label: 'Calligraphy', items: [] }] };
+let CAT = DEFAULT_CATALOG, catLoading = null;
+function loadCatalog(force = false) {
+  if (!catLoading || force) catLoading = getDoc(doc(db, 'config', 'catalog'))
+    .then(s => { const c = s.exists() && s.data().categories; if (Array.isArray(c)) CAT = { categories: c }; }).catch(() => {});
+  return catLoading;
+}
 const FONTS = { script: 'Script', serif: 'Serif' };
 const SWATCH = { black: '#1d1b1a', tan: '#a86b43', blush: '#d9aa98', white: '#efece6', terracotta: '#b9623f' };
 const STATUS_LABEL = { queue: 'Waiting', progress: 'Engraving', done: 'Ready for pickup', picked: 'Picked up' };
@@ -59,10 +66,24 @@ function driveToDirect(url) {
   const m = String(url).match(/drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?(?:export=\w+&)?id=)([\w-]{20,})/);
   return m ? `https://lh3.googleusercontent.com/d/${m[1]}=w900` : String(url).trim();
 }
-function catalog(ev) { return (ev && ev.catalog) || DEFAULT_CATALOG; }
-function itemDef(ev, key) { for (const s of Object.values(catalog(ev))) if (s.items && s.items[key]) return s.items[key]; return null; }
-// Example photos live in /photos/{key}, shared by every event (key: item_color or item_color_addon).
-// Each is fetched the first time a screen needs it, so a guest's phone only downloads what it shows.
+const allPieces = () => CAT.categories.flatMap(c => c.items.map(it => ({ cat: c, it })));
+const pieceDef = id => allPieces().find(p => p.it.id === id) || null;
+// Orders before the catalog change stored color/addon directly instead of opts.
+const optsOf = o => o.opts || { color: o.color, addon: o.addon };
+// An event lists the pieces it offers (new catalog pieces don't appear in it by surprise) and the choices it hides.
+const offered = (ev, id) => !ev?.items || ev.items[id] === true;
+const choicesFor = (ev, it, g) => g.choices.filter(c => !(ev?.hidden || {})[`${it.id}/${g.id}/${c.id}`]);
+const firstOpts = (ev, it) => Object.fromEntries(it.groups.map(g => [g.id, (choicesFor(ev, it, g)[0] || g.choices[0] || {}).id]));
+const pieceLabel = o => o.labels?.piece || pieceDef(o.item)?.it.label || o.item || '';
+function choiceLabels(o) { // [{ g: group label, c: choice label, id }]
+  if (o.labels?.opts) return o.labels.opts;
+  const p = pieceDef(o.item), op = optsOf(o);
+  if (!p) return Object.entries(op).filter(([, v]) => v).map(([g, v]) => ({ g, c: v, id: v }));
+  return p.it.groups.filter(g => op[g.id] != null).map(g => { const ch = g.choices.find(c => c.id === op[g.id]); return { g: g.label, c: ch ? ch.label : op[g.id], id: op[g.id] }; });
+}
+// Example photos live in /photos/{key}, shared by every event. A piece's photos follow its first two
+// option groups: piece_choice1, or piece_choice1_choice2 (a "none" second choice uses the shorter key).
+// Each photo is fetched the first time a screen needs it, so a guest's phone only downloads what it shows.
 const photoLib = {};       // key -> image data URL, or null once we know there is none
 let photoRerender = null;  // the open page's redraw, run when a photo arrives
 let photoTimer = null;
@@ -74,23 +95,30 @@ function requestPhoto(key) {
     if (photoLib[key]) { clearTimeout(photoTimer); photoTimer = setTimeout(() => photoRerender && photoRerender(), 60); }
   }).catch(() => { photoLib[key] = null; });
 }
+function photoKeys(o) {
+  const p = pieceDef(o.item), op = optsOf(o);
+  const [g1, g2] = p ? p.it.groups : [{ id: 'color' }, { id: 'addon' }];
+  const v1 = g1 && op[g1.id], v2 = g2 && op[g2.id];
+  return [...new Set([v1 && v2 && v2 !== 'none' ? `${o.item}_${v1}_${v2}` : null, v1 ? `${o.item}_${v1}` : null, o.item].filter(Boolean))];
+}
 function photoFor(ev, o) {
   const p = (ev && ev.photos) || {}; // older events may still hold pasted photo links
-  const keys = [...new Set([o.addon && o.addon !== 'none' ? `${o.item}_${o.color}_${o.addon}` : null, `${o.item}_${o.color}`, o.item].filter(Boolean))];
-  for (const k of keys) { if (p[k]) return p[k]; requestPhoto(k); if (photoLib[k]) return photoLib[k]; }
+  for (const k of photoKeys(o)) { if (p[k]) return p[k]; requestPhoto(k); if (photoLib[k]) return photoLib[k]; }
   return null;
 }
 function previewHTML(ev, o, withName = true) {
   const photo = photoFor(ev, o);
   if (photo) return `<img src="${esc(photo)}" alt="" loading="lazy">`;
-  return window.EngravePreview.renderPreview({ item: o.item === 'tumbler' ? 'tumbler' : 'bagtag', color: o.color, addon: o.addon, name: withName ? o.name : '', font: o.font });
+  const p = pieceDef(o.item), op = optsOf(o);
+  const sg = p?.it.groups.find(g => g.swatch), ch = sg && sg.choices.find(c => c.id === op[sg.id]);
+  const kind = p?.it.preview || (o.item === 'tumbler' || o.item === 'bagtag' ? o.item : 'card');
+  const mark = Object.values(op).find(v => v === 'stars' || v === 'heart') || 'none';
+  return window.EngravePreview.renderPreview({ item: kind, color: sg ? op[sg.id] : op.color, hex: ch?.color, addon: mark, name: withName ? o.name : '', font: o.font });
 }
-function describe(ev, o, long = false) {
-  const it = itemDef(ev, o.item); if (!it) return o.item || '';
-  const c = (it.colors[o.color] || o.color || '').toLowerCase();
-  const parts = [long ? `${c} ${it.label.toLowerCase()}` : `${c} ${it.label.toLowerCase().replace('leather ', '')}`];
-  if (o.addon && o.addon !== 'none') parts.push((it.addons[o.addon] || o.addon).toLowerCase());
-  return parts.join(' • ');
+function describe(ev, o) {
+  const parts = choiceLabels(o).filter(x => x.id !== 'none').map(x => String(x.c).toLowerCase());
+  const pl = pieceLabel(o).toLowerCase();
+  return parts.length ? [`${parts[0]} ${pl}`, ...parts.slice(1)].join(' • ') : pl;
 }
 const myOrdersKey = id => 'eb-mine-' + id;
 function myOrders(eventId) { try { return JSON.parse(localStorage.getItem(myOrdersKey(eventId)) || '[]'); } catch (e) { return []; } }
@@ -121,15 +149,21 @@ async function staffGate(render) {
 }
 
 // ---------- router ----------
-function route() {
+// Setup and catalog pages set leaveGuard while they hold unsaved changes.
+let leaveGuard = null, lastHash = location.hash;
+async function route() {
+  if (leaveGuard && leaveGuard() && location.hash !== lastHash && !confirm('Leave without saving your changes?')) { history.replaceState(null, '', lastHash || '#/'); return; }
+  leaveGuard = null; lastHash = location.hash;
   cleanup();
   const [view, a, b] = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   window.scrollTo(0, 0);
+  if (view) await loadCatalog();
   if (view === 'e' && a) return guestForm(a);
   if (view === 'o' && a && b) return statusPage(a, b);
   if (view === 'board' && a) return a === DEMO_ID ? ensureGuest().then(() => boardPage(a)) : staffGate(() => boardPage(a));
   if (view === 'admin') return staffGate(() => a ? setupPage(a) : adminPage());
   if (view === 'photos') return staffGate(photosPage);
+  if (view === 'catalog') return staffGate(catalogPage);
   return homePage();
 }
 addEventListener('hashchange', route);
@@ -155,11 +189,18 @@ async function guestForm(eventId) {
   const mine = myOrders(eventId);
   if (ev.open === false) { $app.innerHTML = `<div class="page">${head(false)}<main class="content"><h1>orders are <em>closed</em></h1><p class="note">Thanks for stopping by. Pieces already ordered are still being finished.</p>${mineHTML()}</main></div>`; return; }
 
-  const cat = catalog(ev);
-  const services = (ev.services || ['engraving']).filter(s => cat[s] && Object.keys(cat[s].items).some(k => ev.items?.[k] !== false));
-  const itemsFor = svc => Object.entries(cat[svc]?.items || {}).filter(([k]) => ev.items?.[k] !== false);
-  const st = { step: 1, svc: services[0], item: null, color: null, addon: 'none', name: '', font: 'script', phone: '', sending: false };
-  const f = itemsFor(st.svc)[0]; if (f) { st.item = f[0]; st.color = Object.keys(f[1].colors)[0]; }
+  // Categories with at least one piece this event offers (and every option group still has a choice on).
+  const cats = CAT.categories.map(c => ({ c, items: c.items.filter(it => offered(ev, it.id) && it.groups.every(g => choicesFor(ev, it, g).length)) })).filter(x => x.items.length);
+  const st = { step: 1, cat: cats[0]?.c.id, item: null, opts: {}, name: '', font: 'script', phone: '', sending: false };
+  const curCat = () => cats.find(x => x.c.id === st.cat);
+  const curItem = () => curCat()?.items.find(it => it.id === st.item) || null;
+  function setItem(id) {
+    st.item = id; const it = curItem(); if (!it) return;
+    // Keep choices that still apply when switching pieces (black stays black), else take the first offered one.
+    st.opts = Object.fromEntries(it.groups.map(g => { const ch = choicesFor(ev, it, g); return [g.id, ch.some(c => c.id === st.opts[g.id]) ? st.opts[g.id] : ch[0].id]; }));
+  }
+  if (cats[0]) setItem(cats[0].items[0].id);
+  const order = () => ({ item: st.item, opts: st.opts, name: st.name, font: st.font });
   const submitKey = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random())).replace(/-/g, '').slice(0, 20);
 
   function mineHTML() {
@@ -167,38 +208,45 @@ async function guestForm(eventId) {
     return `<div class="mine"><div class="eyebrow" style="text-align:left">your pieces</div>${mine.map(o => `<a href="#/o/${encodeURIComponent(eventId)}/${esc(o.id)}"><span>${esc(o.name)} • ${shortId(o.id)}</span><b>check status ›</b></a>`).join('')}</div>`;
   }
   const stepsHTML = () => `<ol class="steps">${['piece', 'personalize', 'one last look'].map((s, i) => `<li class="${i + 1 < st.step ? 'dn' : ''}" ${i + 1 === st.step ? 'aria-current="step"' : ''}>${s}</li>`).join('')}</ol>`;
-  const radios = (name, entries, cur, cls, extra = () => '') => `<div class="${cls}" role="radiogroup" aria-label="${esc(name)}">${entries.map(([k, v]) => `<button type="button" role="radio" aria-checked="${k === cur}" data-${name}="${esc(k)}">${extra(k)}${esc(v)}</button>`).join('')}</div>`;
+  const radios = (name, entries, cur, cls) => `<div class="${cls}" role="radiogroup" aria-label="${esc(name)}">${entries.map(([k, v]) => `<button type="button" role="radio" aria-checked="${k === cur}" data-${name}="${esc(k)}">${esc(v)}</button>`).join('')}</div>`;
+  const groupHTML = (it, g) => {
+    const ch = choicesFor(ev, it, g);
+    return `<fieldset><legend>choose your <em>${esc(g.label.toLowerCase())}</em></legend><div class="${g.swatch ? 'sw' : 'seg'}" role="radiogroup" aria-label="${esc(g.label)}">${ch.map(c =>
+      `<button type="button" role="radio" aria-checked="${c.id === st.opts[g.id]}" data-g="${esc(g.id)}" data-c="${esc(c.id)}">${g.swatch ? `<span class="dot" style="background:${esc(c.color || SWATCH[c.id] || '#ccc')}"></span>` : ''}${esc(c.label.toLowerCase())}</button>`).join('')}</div></fieldset>`;
+  };
 
   function render() {
-    const it = st.item ? cat[st.svc].items[st.item] : null;
+    const it = curItem();
     let body = '', bar = '';
     if (st.step === 1) {
+      const items = curCat()?.items || [];
       body = `<div class="rule"></div><h1>make it <em>yours</em></h1>
         <p class="note">pick a piece. we personalize it live, right here.</p>
         ${mineHTML()}
-        ${services.length > 1 ? `<fieldset><legend>engraving or <em>calligraphy?</em></legend>${radios('svc', services.map(s => [s, cat[s].label]), st.svc, 'seg')}</fieldset>` : ''}
+        ${cats.length > 1 ? `<fieldset><legend>what are we <em>making?</em></legend>${radios('cat', cats.map(x => [x.c.id, x.c.label]), st.cat, 'seg')}</fieldset>` : ''}
         <fieldset><legend>what are we personalizing?</legend>
-          <div class="pick" role="radiogroup" aria-label="Piece">${itemsFor(st.svc).map(([k, v]) => `<button type="button" class="pcard" role="radio" aria-checked="${k === st.item}" data-item="${k}">
-            ${k === st.item ? '<span class="tick" aria-hidden="true">✓</span>' : ''}<span class="ph">${previewHTML(ev, { item: k, color: Object.keys(v.colors)[0], addon: 'none', name: '' }, false)}</span><span class="chip">${esc(v.label.toLowerCase())}</span></button>`).join('') || '<p class="note">Nothing is on the menu yet.</p>'}</div></fieldset>
-        <p class="mats">${[...new Set(itemsFor(st.svc).map(([, v]) => v.material).filter(Boolean))].join(' • ')}</p>`;
+          <div class="pick" role="radiogroup" aria-label="Piece">${items.map(p => `<button type="button" class="pcard" role="radio" aria-checked="${p.id === st.item}" data-item="${esc(p.id)}">
+            ${p.id === st.item ? '<span class="tick" aria-hidden="true">✓</span>' : ''}<span class="ph">${previewHTML(ev, { item: p.id, opts: firstOpts(ev, p), name: '' }, false)}</span><span class="chip">${esc(p.label.toLowerCase())}</span></button>`).join('') || '<p class="note">Nothing is on the menu yet.</p>'}</div></fieldset>
+        <p class="mats">${[...new Set(items.map(p => p.material).filter(Boolean))].map(esc).join(' • ')}</p>`;
       bar = `<button class="btn" id="next" type="button" ${it ? '' : 'disabled'}>Choose your details</button>`;
     } else if (st.step === 2) {
+      // A group with a single choice left is decided already; it still shows on the review step.
       body = `${stepsHTML()}
-        <fieldset><legend>choose your <em>${esc(it.finishLabel || 'finish')}</em></legend>${radios('color', Object.entries(it.colors).map(([k, v]) => [k, v.toLowerCase()]), st.color, 'sw', k => `<span class="dot" style="background:${SWATCH[k] || '#ccc'}"></span>`)}</fieldset>
-        <fieldset><legend>add a little something</legend>${radios('addon', Object.entries(it.addons).map(([k, v]) => [k, v.toLowerCase()]), st.addon, 'seg')}</fieldset>
+        ${it.groups.filter(g => choicesFor(ev, it, g).length > 1).map(g => groupHTML(it, g)).join('')}
         <fieldset><legend>whose name goes on it?</legend>
           <label class="lbl" for="nm">Name or initials</label>
           <input id="nm" class="namefield" maxlength="14" autocomplete="off" autocapitalize="words" spellcheck="false" value="${esc(st.name)}">
           <div class="count" id="cnt">${st.name.length} / 14</div>
           ${radios('font', Object.entries(FONTS), st.font, 'seg')}</fieldset>
-        <div class="mini"><span class="ph" id="pv">${previewHTML(ev, st)}</span><div><div class="k">a little preview</div><div class="nm" id="pvn">${esc(st.name) || '&nbsp;'}</div><div class="ds">${esc(describe(ev, st))} • ${esc(FONTS[st.font].toLowerCase())}</div></div></div>
-        ${photoFor(ev, st) ? '<p class="note" style="font-size:.8125rem">Photo shows an example of this style. Yours will have your name.</p>' : ''}`;
+        <div class="mini"><span class="ph" id="pv">${previewHTML(ev, order())}</span><div><div class="k">a little preview</div><div class="nm" id="pvn">${esc(st.name) || '&nbsp;'}</div><div class="ds">${esc(describe(ev, order()))} • ${esc(FONTS[st.font].toLowerCase())}</div></div></div>
+        ${photoFor(ev, order()) ? '<p class="note" style="font-size:.8125rem">Photo shows an example of this style. Yours will have your name.</p>' : ''}`;
       bar = `<button class="btn sec" id="back" type="button">Back</button><button class="btn" id="next" type="button" ${st.name.trim() ? '' : 'disabled'}>Next: one last look</button>`;
     } else {
       body = `${stepsHTML()}<h1>one last <em>look</em></h1>
-        <div class="proof"><span class="ph">${previewHTML(ev, st)}</span>
+        <div class="proof"><span class="ph">${previewHTML(ev, order())}</span>
           <dl class="rows"><div><dt>Name</dt><dd><b style="font-size:1.125rem">${esc(st.name.trim())}</b></dd></div><div><dt>Piece</dt><dd>${esc(it.label)}</dd></div>
-          <div><dt>Details</dt><dd>${esc(it.colors[st.color])} • ${esc(it.addons[st.addon])} • ${esc(FONTS[st.font])}</dd></div>
+          ${it.groups.map(g => `<div><dt>${esc(g.label)}</dt><dd>${esc(g.choices.find(c => c.id === st.opts[g.id])?.label || '')}</dd></div>`).join('')}
+          <div><dt>Lettering</dt><dd>${esc(FONTS[st.font])}</dd></div>
           </dl><div class="spell"><span>Spelled right?</span><button class="editbtn" id="edit" type="button">✎ Edit</button></div></div>
         <div class="optin"><label class="lbl" for="ph">Want a text when it's ready? <span>optional</span></label>
           <input id="ph" class="phonefield" type="tel" inputmode="tel" autocomplete="tel" placeholder="(214) 555-0123" value="${esc(st.phone)}">
@@ -210,17 +258,16 @@ async function guestForm(eventId) {
     bind();
   }
   function bind() {
-    $app.querySelectorAll('[data-svc]').forEach(b => b.onclick = () => { st.svc = b.dataset.svc; const g = itemsFor(st.svc)[0]; st.item = g ? g[0] : null; st.color = g ? Object.keys(g[1].colors)[0] : null; st.addon = 'none'; render(); });
-    $app.querySelectorAll('[data-item]').forEach(b => b.onclick = () => { st.item = b.dataset.item; const d = cat[st.svc].items[st.item]; if (!d.colors[st.color]) st.color = Object.keys(d.colors)[0]; if (!d.addons[st.addon]) st.addon = 'none'; render(); });
-    $app.querySelectorAll('[data-color]').forEach(b => b.onclick = () => { st.color = b.dataset.color; render(); });
-    $app.querySelectorAll('[data-addon]').forEach(b => b.onclick = () => { st.addon = b.dataset.addon; render(); });
+    $app.querySelectorAll('[data-cat]').forEach(b => b.onclick = () => { st.cat = b.dataset.cat; setItem(curCat().items[0].id); render(); });
+    $app.querySelectorAll('[data-item]').forEach(b => b.onclick = () => { setItem(b.dataset.item); render(); });
+    $app.querySelectorAll('[data-g]').forEach(b => b.onclick = () => { st.opts[b.dataset.g] = b.dataset.c; render(); });
     $app.querySelectorAll('[data-font]').forEach(b => b.onclick = () => { st.font = b.dataset.font; render(); });
     const nm = document.getElementById('nm');
     if (nm) nm.oninput = () => {
       st.name = nm.value.replace(/^\s+/, '');
       document.getElementById('cnt').textContent = `${st.name.length} / 14`;
-      document.getElementById('pvn').textContent = st.name || ' ';
-      if (!photoFor(ev, st)) document.getElementById('pv').innerHTML = previewHTML(ev, st);
+      document.getElementById('pvn').textContent = st.name || ' ';
+      if (!photoFor(ev, order())) document.getElementById('pv').innerHTML = previewHTML(ev, order());
       document.getElementById('next').disabled = !st.name.trim();
     };
     const go = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
@@ -234,16 +281,22 @@ async function guestForm(eventId) {
     const name = st.name.trim().slice(0, 14);
     const phone = normPhone(st.phone);
     if (phone === null) { document.getElementById('err').textContent = "That number doesn't look right. Use a 10-digit US mobile number, or leave it blank."; document.getElementById('ph')?.focus(); return; }
-    // Re-check the event is still taking orders and the piece is still offered.
+    const it = curItem();
+    // Re-check the event is still taking orders and the piece and choices are still offered.
     try {
       const s = await getDoc(doc(db, 'events', eventId)); const fresh = s.exists() ? s.data() : null;
       if (fresh && fresh.open === false) { document.getElementById('err').textContent = 'Orders just closed for this event.'; return; }
-      if (fresh && fresh.items?.[st.item] === false) { document.getElementById('err').textContent = 'That piece just sold out. Pick another and your name will carry over.'; st.step = 1; setTimeout(render, 1600); return; }
+      if (fresh && (!offered(fresh, it.id) || it.groups.some(g => !choicesFor(fresh, it, g).some(c => c.id === st.opts[g.id])))) {
+        document.getElementById('err').textContent = 'That just sold out. Pick another and your name will carry over.';
+        ev = fresh; st.step = 1; setTimeout(render, 1600); return;
+      }
     } catch (e) { /* offline: the order still queues locally */ }
     st.sending = true; render();
     // The order id is fixed for this form visit, so a retry overwrites the same order instead of creating a second one.
     const ref = doc(db, 'events', eventId, 'orders', submitKey);
-    const data = { uid: user.uid, service: st.svc, item: st.item, color: st.color, addon: st.addon, font: st.font, name, status: 'queue', engraver: null, createdAt: serverTimestamp(), clientAt: Date.now(), ...(phone ? { phone, textOptIn: true, optInAt: Date.now() } : {}) };
+    // Labels are copied onto the order so the board and exports still read right if the catalog is renamed later.
+    const labels = { piece: it.label, opts: it.groups.map(g => ({ g: g.label, c: g.choices.find(c => c.id === st.opts[g.id])?.label || st.opts[g.id], id: st.opts[g.id] })) };
+    const data = { uid: user.uid, service: st.cat, item: it.id, opts: { ...st.opts }, labels, font: st.font, name, status: 'queue', engraver: null, createdAt: serverTimestamp(), clientAt: Date.now(), ...(phone ? { phone, textOptIn: true, optInAt: Date.now() } : {}) };
     // One batch: create the order and add it to the bottom of the public line, so the guest's
     // "pieces ahead" count works even when no board is open.
     const batch = writeBatch(db);
@@ -254,7 +307,7 @@ async function guestForm(eventId) {
     location.hash = `#/o/${encodeURIComponent(eventId)}/${ref.id}`;
   }
   // A photo arriving mid-typing only swaps the preview, so the name field keeps focus.
-  photoRerender = () => { if (document.activeElement?.id === 'nm') { const pv = document.getElementById('pv'); if (pv) pv.innerHTML = previewHTML(ev, st); } else render(); };
+  photoRerender = () => { if (document.activeElement?.id === 'nm') { const pv = document.getElementById('pv'); if (pv) pv.innerHTML = previewHTML(ev, order()); } else render(); };
   render();
 }
 
@@ -366,7 +419,7 @@ async function resetDemo() {
   const old = await getDoc(evRef).catch(() => null);
   const prev = old && old.exists() ? old.data() : null;
   const today = new Date(); const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-  if (await isStaff()) await setDoc(evRef, { name: 'Demo event', date, engravers: DEMO_ENGRAVERS, items: { bagtag: true, tumbler: true }, services: ['engraving'], catalog: DEFAULT_CATALOG,
+  if (await isStaff()) await setDoc(evRef, { name: 'Demo event', date, engravers: DEMO_ENGRAVERS, items: { bagtag: true, tumbler: true }, hidden: prev?.hidden || {},
     photos: prev?.photos || {}, pickupNote: prev?.pickupNote || 'at the engraving table', open: true, demo: true, createdAt: prev?.createdAt || serverTimestamp() });
   // Clear every order in the demo event.
   const snap = await getDocs(collection(db, 'events', DEMO_ID, 'orders'));
@@ -376,7 +429,7 @@ async function resetDemo() {
   const make = writeBatch(db), place = writeBatch(db);
   DEMO_ORDERS.forEach(([id, name, item, color, addon, font, status, engraver, sub, started, ready, picked]) => {
     const ref = doc(db, 'events', DEMO_ID, 'orders', id);
-    make.set(ref, { uid: user.uid, service: 'engraving', item, color, addon, font, name, status: 'queue', engraver: null, createdAt: ago(sub), clientAt: Date.now() - sub * 60000, demo: true });
+    make.set(ref, { uid: user.uid, service: 'engraving', item, opts: { color, addon }, font, name, status: 'queue', engraver: null, createdAt: ago(sub), clientAt: Date.now() - sub * 60000, demo: true });
     if (status !== 'queue') place.update(ref, { status, engraver, startedAt: ago(started), doneAt: ago(ready), pickedAt: ago(picked), updatedAt: serverTimestamp() });
   });
   await make.commit();
@@ -439,7 +492,7 @@ async function boardPage(eventId) {
         <div class="k"><span><b>${n.q}</b>waiting</span><span><b>${n.p}</b>engraving</span><span><b>${n.x}</b>picked up</span>
           <button class="pu" id="openpk" type="button">${n.r} to pick up ›</button>
           <span class="lv ${online() ? '' : 'off'}"><i aria-hidden="true"></i>${online() ? 'Live' : 'Offline • moves save on this iPad'}</span>
-          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}<a href="#/admin/${encodeURIComponent(eventId)}">event setup</a><a href="#/admin">all events</a></div>${WAVE(1180)}</header>
+          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}<a href="#/admin/${encodeURIComponent(eventId)}">event setup</a><a href="#/catalog">catalog</a></div>${WAVE(1180)}</header>
       <main class="lanes" style="--n:${engravers().length}">
         <section class="lane" aria-label="Queue"><h2>queue <small>first in line at the top</small></h2>
           <div class="drop" data-status="queue" data-engraver="">${q.map((o, i) => queueCard(o, free, i)).join('') || '<p class="note">No one waiting.</p>'}</div></section>
@@ -511,50 +564,60 @@ const fmtStamp = d => d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStar
 const minsBetween = (a, b) => (a && b && b >= a) ? Math.round((b - a) / 6000) / 10 : '';
 async function exportOrders(eventId, ev) {
   const snap = await getDocs(query(collection(db, 'events', eventId, 'orders'), orderBy('createdAt')));
-  const head = ['Order #', 'Name', 'Service', 'Item', 'Finish', 'Detail', 'Lettering', 'Submitted', 'Handled by', 'Started', 'Ready', 'Picked up', 'Wait in queue (min)', 'Time to make (min)', 'Submit to ready (min)', 'Status'];
+  const head = ['Order #', 'Name', 'Category', 'Piece', 'Choices', 'Lettering', 'Texts', 'Submitted', 'Handled by', 'Started', 'Ready', 'Picked up', 'Wait in queue (min)', 'Time to make (min)', 'Submit to ready (min)', 'Status'];
   const rows = snap.docs.map(d => {
-    const o = d.data(); const it = itemDef(ev, o.item) || { label: o.item, colors: {}, addons: {} };
+    const o = d.data();
     const sub = tsDate(o.createdAt), st = tsDate(o.startedAt), dn = (o.status === 'done' || o.status === 'picked') ? tsDate(o.doneAt) : null, pk = o.status === 'picked' ? tsDate(o.pickedAt) : null;
-    return [shortId(d.id), o.name, catalog(ev)[o.service]?.label || o.service || '', it.label, it.colors[o.color] || o.color || '', it.addons[o.addon] || o.addon || '',
-      FONTS[o.font] || o.font || '', fmtStamp(sub), o.engraver || '', fmtStamp(st), fmtStamp(dn), fmtStamp(pk), minsBetween(sub, st), minsBetween(st, dn), minsBetween(sub, dn), STATUS_LABEL[o.status] || o.status];
+    return [shortId(d.id), o.name, CAT.categories.find(c => c.id === o.service)?.label || o.service || '', pieceLabel(o), choiceLabels(o).map(x => `${x.g}: ${x.c}`).join('; '),
+      FONTS[o.font] || o.font || '', o.phone ? 'yes' : '', fmtStamp(sub), o.engraver || '', fmtStamp(st), fmtStamp(dn), fmtStamp(pk), minsBetween(sub, st), minsBetween(st, dn), minsBetween(sub, dn), STATUS_LABEL[o.status] || o.status];
   });
   const cell = v => { const t = String(v ?? ''); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
-  const csv = '﻿' + [head, ...rows].map(r => r.map(cell).join(',')).join('\r\n');
+  const csv = '\ufeff' + [head, ...rows].map(r => r.map(cell).join(',')).join('\r\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
   const a = document.createElement('a'); a.href = url; a.download = `${eventId}-orders.csv`; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
   toast(`${rows.length} orders exported. In Google Sheets: File → Import → Upload.`);
 }
 
-// ---------- staff: events list, event setup, photo library ----------
-const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-const allItems = () => Object.values(DEFAULT_CATALOG).flatMap(s => Object.entries(s.items));
+// ---------- staff: event setup, catalog, photos ----------
+const slug = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
 const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 const guestUrl = id => `${baseUrl()}#/e/${encodeURIComponent(id)}`;
 const qrSvg = url => { const q = qrcode(0, 'M'); q.addData(url); q.make(); return q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }); };
 function downloadQr(url, name) { const q = qrcode(0, 'M'); q.addData(url); q.make(); const l = document.createElement('a'); l.href = q.createDataURL(12, 4); l.download = `qr-${name}.gif`; l.click(); }
-const staffHead = title => `<header class="band">${LOGO}<div class="ev">${esc(title)}</div>${WAVE(1180)}</header>
-  <nav class="snav" aria-label="Staff"><a href="#/admin">Events</a><a href="#/photos">Photos</a><span>${esc(user.email)}</span><a href="#" id="out">Sign out</a></nav>`;
+const STAFF_TABS = [['setup', '#/admin', 'Event setup'], ['catalog', '#/catalog', 'Catalog'], ['photos', '#/photos', 'Photos']];
+const staffHead = (title, tab) => `<header class="band">${LOGO}<div class="ev">${esc(title)}</div>${WAVE(1180)}</header>
+  <nav class="snav" aria-label="Staff">${STAFF_TABS.map(([k, h, l]) => `<a href="${h}" ${k === tab ? 'aria-current="page"' : ''}>${l}</a>`).join('')}<span>${esc(user.email)}</span><a href="#" id="out">Sign out</a></nav>`;
 function bindStaffHead() { const o = document.getElementById('out'); if (o) o.onclick = e => { e.preventDefault(); signOut(auth).then(() => { location.hash = '#/'; }); }; }
 const staffLoading = msg => `<div class="page"><p class="note" style="padding:40px">${esc(msg)}</p></div>`;
+const dropHidden = h => Object.fromEntries(Object.entries(h || {}).filter(([, v]) => v === true));
+async function listEvents() { return (await getDocs(collection(db, 'events'))).docs.map(d => ({ id: d.id, ...d.data() })); }
+const byDateDesc = (a, b) => String(b.date || '').localeCompare(String(a.date || ''));
+
+// The parts of an event's setup that carry over to the next one.
+const setupFrom = src => ({ engravers: [...(src.engravers || [])], pickupNote: src.pickupNote || 'at the engraving table',
+  items: Object.fromEntries(allPieces().map(({ it }) => [it.id, offered(src, it.id)])), hidden: dropHidden(src.hidden) });
 
 async function adminPage() {
   $app.innerHTML = staffLoading('Loading events…');
   let evs;
-  try { evs = (await getDocs(collection(db, 'events'))).docs.map(d => ({ id: d.id, ...d.data() })); }
+  try { evs = await listEvents(); }
   catch (e) { $app.innerHTML = `<div class="wrap"><p class="err">Could not load events: ${esc(e.code || e.message)}</p></div>`; return; }
   const today = todayStr();
   const real = evs.filter(e => e.id !== DEMO_ID);
-  const upcoming = real.filter(e => (e.date || '') >= today).sort((a, b) => String(a.date).localeCompare(String(b.date)));
-  const past = real.filter(e => (e.date || '') < today).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  const upcoming = real.filter(e => (e.date || '') >= today).sort((a, b) => -byDateDesc(a, b));
+  const past = real.filter(e => (e.date || '') < today).sort(byDateDesc);
   const demo = evs.find(e => e.id === DEMO_ID);
-  const card = ev => `<a class="evcard" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} engravers</span></div>
+  const card = ev => `<a class="evcard" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} engravers · ${allPieces().filter(p => offered(ev, p.it.id)).length} pieces</span></div>
     <span class="chip ${ev.open === false ? '' : 'on'}">${ev.open === false ? 'Closed' : 'Taking orders'}</span><span class="chev" aria-hidden="true">›</span></a>`;
-  $app.innerHTML = `${staffHead('staff')}<main class="wrap">
-    <h1>your <em>events</em></h1>
+  $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap">
+    <h1>event <em>setup</em></h1>
     <form id="new" class="card newev"><h2>new event</h2>
       <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
       <div class="field"><label class="lbl" for="n-date">Date</label><input id="n-date" type="date" required value="${today}"></div>
+      <div class="field wide"><label class="lbl" for="n-from">Start from</label><select id="n-from"><option value="">Everything in the catalog</option>
+        ${real.slice().sort(byDateDesc).map(e => `<option value="${esc(e.id)}">Copy ${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select>
+        <span class="hint">Copying brings over the engravers, pickup spot, and which pieces and choices are offered.</span></div>
       <button class="btn">Create and set up</button></form>
     <h2 class="sec">upcoming</h2><div class="evlist">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled. Create one above.</p>'}</div>
     ${past.length ? `<details class="pastev"><summary>Past events (${past.length})</summary><div class="evlist">${past.map(card).join('')}</div></details>` : ''}
@@ -569,13 +632,14 @@ async function adminPage() {
     e.preventDefault();
     const name = document.getElementById('n-name').value.trim(), date = document.getElementById('n-date').value;
     if (!name || !date) return;
+    const src = evs.find(x => x.id === document.getElementById('n-from').value);
     const btn = e.target.querySelector('.btn'); btn.disabled = true;
     try {
       // Never overwrite an existing event that happens to share the name and date.
       const base = slug(`${name}-${date}`) || 'event'; let id = base;
       for (let n = 2; (await getDoc(doc(db, 'events', id))).exists(); n++) id = `${base}-${n}`;
-      const items = Object.fromEntries(allItems().map(([k]) => [k, true]));
-      await setDoc(doc(db, 'events', id), { name, date, engravers: ['Steph', 'Veronica', 'Christina', 'DeVaughn'], items, services: ['engraving'], catalog: DEFAULT_CATALOG, photos: {}, pickupNote: 'at the engraving table', open: true, createdAt: serverTimestamp() });
+      const setup = src ? setupFrom(src) : { engravers: ['Steph', 'Veronica', 'Christina', 'DeVaughn'], pickupNote: 'at the engraving table', items: Object.fromEntries(allPieces().map(({ it }) => [it.id, true])), hidden: {} };
+      await setDoc(doc(db, 'events', id), { name, date, ...setup, photos: {}, open: true, createdAt: serverTimestamp(), ...(src ? { copiedFrom: src.id } : {}) });
       location.hash = `#/admin/${encodeURIComponent(id)}`;
     } catch (err) { btn.disabled = false; toast('Could not create: ' + (err.code || err.message)); }
   };
@@ -583,67 +647,87 @@ async function adminPage() {
 
 async function setupPage(eventId) {
   $app.innerHTML = staffLoading('Loading event…');
-  let ev;
-  try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) { ev = null; }
-  if (!ev) { $app.innerHTML = `${staffHead('event setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
-  const st = { name: ev.name || '', date: ev.date || '', pickup: ev.pickupNote || 'at the engraving table', open: ev.open !== false,
-    engravers: [...(ev.engravers || [])], items: Object.fromEntries(allItems().map(([k]) => [k, ev.items?.[k] !== false])) };
-  const savedEngravers = [...st.engravers];
-  let dirty = false, saving = false;
+  let ev = null, others = [];
+  try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
+  if (!ev) { $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
+  try { others = (await listEvents()).filter(e => e.id !== eventId && e.id !== DEMO_ID).sort(byDateDesc); } catch (e) {}
+  const st = { name: ev.name || '', date: ev.date || '', open: ev.open !== false, ...setupFrom(ev) };
+  let savedEngravers = [...st.engravers], dirty = false, saving = false, savedName = st.name;
   const url = guestUrl(eventId);
   const legacy = Object.keys(ev.photos || {}).length;
-  const markDirty = () => { dirty = true; const d = document.getElementById('dirty'); if (d) d.textContent = 'Unsaved changes'; const b = document.getElementById('save'); if (b) b.disabled = false; };
+  leaveGuard = () => dirty;
+
   const chipsHTML = () => st.engravers.map((e, i) => `<span>${esc(e)}<button type="button" data-rm="${i}" aria-label="Remove ${esc(e)}">×</button></span>`).join('') || '<em class="note">No engravers yet.</em>';
-
-  $app.innerHTML = `${staffHead('event setup')}<main class="wrap setup">
-    <h1>${esc(st.name)}</h1>
-    <div class="btnrow"><a class="btn" href="#/board/${encodeURIComponent(eventId)}">Open board</a><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Preview guest form</a></div>
-    <section class="card"><h2>details</h2>
-      <div class="field"><label class="lbl" for="s-name">Event name</label><input id="s-name" value="${esc(st.name)}"></div>
-      <div class="field"><label class="lbl" for="s-date">Date</label><input id="s-date" type="date" value="${esc(st.date)}"></div>
-      <div class="field"><label class="lbl" for="s-pick">Where guests pick up (finishes "pick it up …")</label><input id="s-pick" value="${esc(st.pickup)}"></div>
-      <label class="tog"><input type="checkbox" id="s-open" ${st.open ? 'checked' : ''}> Taking orders <small>Turn off to close the guest form. Pieces already ordered still show on the board.</small></label></section>
-    <section class="card"><h2>engravers</h2><p class="hint">Each engraver gets a lane on the board.</p>
-      <div class="chips" id="chips">${chipsHTML()}</div>
-      <div class="addrow"><label class="vh" for="s-eng">Add an engraver</label><input id="s-eng" placeholder="Name" autocapitalize="words"><button class="btn out" id="addeng" type="button">Add</button></div></section>
-    <section class="card"><h2>pieces offered</h2><p class="hint">Guests only see the pieces checked here. Example photos come from the <a href="#/photos">photo library</a>.</p>
-      <div class="items">${allItems().map(([k, v]) => `<label class="itile"><span class="ph">${previewHTML(ev, { item: k, color: Object.keys(v.colors)[0], addon: 'none' }, false)}</span>
-        <span><input type="checkbox" data-item="${k}" ${st.items[k] ? 'checked' : ''}> ${esc(v.label)}</span></label>`).join('')}</div></section>
-    <section class="card"><h2>guest link &amp; QR</h2>
-      <div class="share"><div class="qr" aria-label="QR code for the guest form">${qrSvg(url)}</div>
-        <div class="shareinfo"><div class="url">${esc(url)}</div><div class="btnrow"><button class="btn out" id="copy" type="button">Copy link</button><button class="btn out" id="dlqr" type="button">Download QR to print</button></div></div></div></section>
-    <section class="card"><h2>after the event</h2><p class="hint">Orders with times for each step, as a file Google Sheets opens.</p>
-      <button class="btn out" id="export" type="button">Export orders</button>
-      ${legacy ? `<p class="hint" style="margin-top:14px">This event still has ${legacy} photo link${legacy === 1 ? '' : 's'} from the old setup, which override the photo library.</p><button class="linkbtn" id="clearlegacy" type="button">Remove old photo links</button>` : ''}</section>
-  </main>
-  <div class="savebar"><span id="dirty">All changes saved</span><button class="btn" id="save" type="button" disabled>Save</button></div>`;
-  bindStaffHead();
-  photoRerender = () => document.querySelectorAll('.itile').forEach((t, i) => { const [k, v] = allItems()[i]; t.querySelector('.ph').innerHTML = previewHTML(ev, { item: k, color: Object.keys(v.colors)[0], addon: 'none' }, false); });
-
-  const bindChips = () => document.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { st.engravers.splice(+b.dataset.rm, 1); document.getElementById('chips').innerHTML = chipsHTML(); bindChips(); markDirty(); });
-  bindChips();
-  const engIn = document.getElementById('s-eng');
-  const addEng = () => {
-    const n = engIn.value.trim(); if (!n) return;
-    if (st.engravers.some(e => e.toLowerCase() === n.toLowerCase())) { toast(`${n} is already on the list`); return; }
-    st.engravers.push(n); engIn.value = ''; document.getElementById('chips').innerHTML = chipsHTML(); bindChips(); markDirty(); engIn.focus();
+  const pieceRow = it => {
+    const on = st.items[it.id] === true;
+    const shown = { ...ev, items: st.items, hidden: st.hidden };
+    return `<div class="prow ${on ? 'on' : ''}"><label class="ptop"><span class="ph">${previewHTML(shown, { item: it.id, opts: firstOpts(shown, it) }, false)}</span>
+      <span class="pn"><span><input type="checkbox" data-item="${esc(it.id)}" ${on ? 'checked' : ''}> <b>${esc(it.label)}</b></span><small>${on ? (it.groups.length ? 'Tap a choice to turn it off for this event.' : 'No options; guests just add a name.') : 'Not offered at this event'}</small></span></label>
+      ${on ? it.groups.map(g => `<div class="cgrp"><span class="gl">${esc(g.label)}</span><div class="cchips">${g.choices.map(c => { const path = `${it.id}/${g.id}/${c.id}`, off = st.hidden[path] === true;
+        return `<button type="button" class="cc" aria-pressed="${!off}" data-ch="${esc(path)}">${g.swatch ? `<i style="background:${esc(c.color || SWATCH[c.id] || '#ccc')}"></i>` : ''}${esc(c.label)}</button>`; }).join('')}</div></div>`).join('') : ''}</div>`;
   };
-  document.getElementById('addeng').onclick = addEng;
-  engIn.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addEng(); } };
-  [['s-name', 'name'], ['s-date', 'date'], ['s-pick', 'pickup']].forEach(([id, k]) => document.getElementById(id).oninput = e => { st[k] = e.target.value; markDirty(); });
-  document.getElementById('s-open').onchange = e => { st.open = e.target.checked; markDirty(); };
-  document.querySelectorAll('[data-item]').forEach(c => c.onchange = () => { st.items[c.dataset.item] = c.checked; markDirty(); });
-  document.getElementById('copy').onclick = () => (navigator.clipboard?.writeText(url) || Promise.reject()).then(() => toast('Guest link copied')).catch(() => toast(url));
-  document.getElementById('dlqr').onclick = () => downloadQr(url, eventId);
-  document.getElementById('export').onclick = async () => { try { await exportOrders(eventId, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); } };
-  const cl = document.getElementById('clearlegacy');
-  if (cl) cl.onclick = async () => { try { await updateDoc(doc(db, 'events', eventId), { photos: {} }); toast('Old photo links removed'); setupPage(eventId); } catch (err) { toast('Could not remove: ' + (err.code || err.message)); } };
 
-  document.getElementById('save').onclick = async () => {
+  function render() {
+    $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap setup">
+      <a class="backlink" href="#/admin">‹ All events</a>
+      <h1>${esc(savedName)}</h1>
+      <div class="btnrow"><a class="btn" href="#/board/${encodeURIComponent(eventId)}">Open board</a><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Preview guest form</a></div>
+      ${others.length ? `<section class="card"><h2>copy from another event</h2><p class="hint">Brings over engravers, pickup spot, and pieces and choices. Name, date, and orders stay as they are. Nothing saves until you tap Save.</p>
+        <div class="addrow"><label class="vh" for="cp-from">Event to copy</label><select id="cp-from">${others.map(e => `<option value="${esc(e.id)}">${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select><button class="btn out" id="cp" type="button">Copy</button></div></section>` : ''}
+      <section class="card"><h2>details</h2>
+        <div class="field"><label class="lbl" for="s-name">Event name</label><input id="s-name" value="${esc(st.name)}"></div>
+        <div class="field"><label class="lbl" for="s-date">Date</label><input id="s-date" type="date" value="${esc(st.date)}"></div>
+        <div class="field"><label class="lbl" for="s-pick">Where guests pick up (finishes "pick it up …")</label><input id="s-pick" value="${esc(st.pickupNote)}"></div>
+        <label class="tog"><input type="checkbox" id="s-open" ${st.open ? 'checked' : ''}> Taking orders <small>Turn off to close the guest form. Pieces already ordered still show on the board.</small></label></section>
+      <section class="card"><h2>engravers</h2><p class="hint">Each engraver gets a lane on the board.</p>
+        <div class="chips" id="chips">${chipsHTML()}</div>
+        <div class="addrow"><label class="vh" for="s-eng">Add an engraver</label><input id="s-eng" placeholder="Name" autocapitalize="words"><button class="btn out" id="addeng" type="button">Add</button></div></section>
+      <section class="card"><h2>pieces &amp; choices</h2><p class="hint">Check the pieces this event offers, then tap any choice to switch it off here only. To add pieces or choices, edit the <a href="#/catalog">catalog</a>.</p>
+        ${CAT.categories.filter(c => c.items.length).map(c => `<h3 class="cathead">${esc(c.label)}</h3>${c.items.map(pieceRow).join('')}`).join('') || '<p class="note">The catalog is empty.</p>'}</section>
+      <section class="card"><h2>guest link &amp; QR</h2>
+        <div class="share"><div class="qr" aria-label="QR code for the guest form">${qrSvg(url)}</div>
+          <div class="shareinfo"><div class="url">${esc(url)}</div><div class="btnrow"><button class="btn out" id="copy" type="button">Copy link</button><button class="btn out" id="dlqr" type="button">Download QR to print</button></div></div></div></section>
+      <section class="card"><h2>after the event</h2><p class="hint">Orders with times for each step, as a file Google Sheets opens.</p>
+        <button class="btn out" id="export" type="button">Export orders</button>
+        ${legacy ? `<p class="hint" style="margin-top:14px">This event still has ${legacy} photo link${legacy === 1 ? '' : 's'} from the old setup, which override the photo library.</p><button class="linkbtn" id="clearlegacy" type="button">Remove old photo links</button>` : ''}</section>
+    </main>
+    <div class="savebar"><span id="dirty">${dirty ? 'Unsaved changes' : 'All changes saved'}</span><button class="btn" id="save" type="button" ${dirty ? '' : 'disabled'}>Save</button></div>`;
+    bind();
+  }
+  const markDirty = () => { dirty = true; document.getElementById('dirty').textContent = 'Unsaved changes'; document.getElementById('save').disabled = false; };
+  function bind() {
+    bindStaffHead();
+    const bindChips = () => document.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { st.engravers.splice(+b.dataset.rm, 1); document.getElementById('chips').innerHTML = chipsHTML(); bindChips(); markDirty(); });
+    bindChips();
+    const engIn = document.getElementById('s-eng');
+    const addEng = () => {
+      const n = engIn.value.trim(); if (!n) return;
+      if (st.engravers.some(e => e.toLowerCase() === n.toLowerCase())) { toast(`${n} is already on the list`); return; }
+      st.engravers.push(n); engIn.value = ''; document.getElementById('chips').innerHTML = chipsHTML(); bindChips(); markDirty(); engIn.focus();
+    };
+    document.getElementById('addeng').onclick = addEng;
+    engIn.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addEng(); } };
+    [['s-name', 'name'], ['s-date', 'date'], ['s-pick', 'pickupNote']].forEach(([id, k]) => document.getElementById(id).oninput = e => { st[k] = e.target.value; markDirty(); });
+    document.getElementById('s-open').onchange = e => { st.open = e.target.checked; markDirty(); };
+    document.querySelectorAll('[data-item]').forEach(c => c.onchange = () => { st.items[c.dataset.item] = c.checked; dirty = true; render(); });
+    document.querySelectorAll('[data-ch]').forEach(b => b.onclick = () => { const p = b.dataset.ch; if (st.hidden[p]) delete st.hidden[p]; else st.hidden[p] = true; b.setAttribute('aria-pressed', String(!st.hidden[p])); markDirty(); });
+    const cp = document.getElementById('cp');
+    if (cp) cp.onclick = () => { const src = others.find(e => e.id === document.getElementById('cp-from').value); if (!src) return; Object.assign(st, setupFrom(src)); dirty = true; render(); toast(`Copied setup from ${src.name}. Review it, then Save.`); };
+    document.getElementById('copy').onclick = () => (navigator.clipboard?.writeText(url) || Promise.reject()).then(() => toast('Guest link copied')).catch(() => toast(url));
+    document.getElementById('dlqr').onclick = () => downloadQr(url, eventId);
+    document.getElementById('export').onclick = async () => { try { await exportOrders(eventId, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); } };
+    const cl = document.getElementById('clearlegacy');
+    if (cl) cl.onclick = async () => { try { await updateDoc(doc(db, 'events', eventId), { photos: {} }); ev.photos = {}; toast('Old photo links removed'); render(); } catch (err) { toast('Could not remove: ' + (err.code || err.message)); } };
+    document.getElementById('save').onclick = save;
+  }
+  async function save() {
     if (saving || !dirty) return;
     if (!st.name.trim() || !st.date) { toast('The event needs a name and a date.'); return; }
     if (!st.engravers.length) { toast('Add at least one engraver.'); return; }
-    if (!Object.values(st.items).some(Boolean)) { toast('Offer at least one piece.'); return; }
+    const on = allPieces().filter(({ it }) => st.items[it.id]);
+    if (!on.length) { toast('Offer at least one piece.'); return; }
+    const empty = on.flatMap(({ it }) => it.groups.filter(g => !g.choices.some(c => !st.hidden[`${it.id}/${g.id}/${c.id}`])).map(g => `${it.label}: ${g.label}`));
+    if (empty.length) { toast(`Leave at least one choice on for ${empty[0]}.`); return; }
     saving = true; const b = document.getElementById('save'); b.disabled = true; b.textContent = 'Saving…';
     try {
       // Removing an engraver hides their lane, so don't allow it while they have a piece in progress.
@@ -652,16 +736,145 @@ async function setupPage(eventId) {
         const busy = (await getDocs(collection(db, 'events', eventId, 'orders'))).docs.map(d => d.data()).find(o => o.status === 'progress' && removed.includes(o.engraver));
         if (busy) { toast(`${busy.engraver} has ${busy.name}'s piece in progress. Finish or move it before removing them.`); return; }
       }
-      await updateDoc(doc(db, 'events', eventId), { name: st.name.trim(), date: st.date, pickupNote: st.pickup.trim() || 'at the engraving table', open: st.open, engravers: st.engravers, items: st.items, updatedAt: serverTimestamp() });
-      savedEngravers.splice(0, savedEngravers.length, ...st.engravers);
-      dirty = false; document.getElementById('dirty').textContent = 'All changes saved'; document.querySelector('.setup h1').textContent = st.name.trim(); toast('Saved');
+      await updateDoc(doc(db, 'events', eventId), { name: st.name.trim(), date: st.date, pickupNote: st.pickupNote.trim() || 'at the engraving table', open: st.open,
+        engravers: st.engravers, items: st.items, hidden: dropHidden(st.hidden), updatedAt: serverTimestamp() });
+      savedEngravers = [...st.engravers]; savedName = st.name.trim(); dirty = false; render(); toast('Saved');
     } catch (err) { toast('Could not save: ' + (err.code || err.message)); }
-    finally { saving = false; b.textContent = 'Save'; b.disabled = !dirty; }
-  };
+    finally { saving = false; const s = document.getElementById('save'); if (s) { s.textContent = 'Save'; s.disabled = !dirty; } }
+  }
   const leave = e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } };
   addEventListener('beforeunload', leave); unsubs.push(() => removeEventListener('beforeunload', leave));
+  photoRerender = render;
+  render();
 }
 
+// ---------- catalog editor ----------
+async function catalogPage() {
+  $app.innerHTML = staffLoading('Loading catalog…');
+  await loadCatalog(true);
+  const cat = JSON.parse(JSON.stringify(CAT));
+  const opened = new Set();
+  let dirty = false, saving = false;
+  leaveGuard = () => dirty;
+  const DRAW = [['bagtag', 'Bag tag drawing'], ['tumbler', 'Tumbler drawing'], ['card', 'Card with the name']];
+  const at = el => { const d = el.closest('[data-ci]').dataset; return { c: cat.categories[+d.ci], it: d.ii != null ? cat.categories[+d.ci].items[+d.ii] : null }; };
+  const grp = el => at(el).it.groups[+el.closest('[data-gi]').dataset.gi];
+  const move = (arr, i, d) => { const j = i + d; if (j < 0 || j >= arr.length) return; [arr[i], arr[j]] = [arr[j], arr[i]]; };
+  const tools = (kind, i, n) => `<span class="tools"><button type="button" data-up="${kind}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button><button type="button" data-down="${kind}" ${i === n - 1 ? 'disabled' : ''} aria-label="Move down">↓</button><button type="button" data-del="${kind}" aria-label="Delete">×</button></span>`;
+
+  const groupHTML = (g, gi, n) => `<div class="gedit" data-gi="${gi}">
+    <div class="ghead"><label class="vh">Option group name</label><input class="gname" data-f="group" value="${esc(g.label)}" placeholder="e.g. Finish, Size, Detail">
+      <label class="sw-tog"><input type="checkbox" data-swatch ${g.swatch ? 'checked' : ''}> color dots</label>${tools('group', gi, n)}</div>
+    <div class="chlist">${g.choices.map((c, xi) => `<span class="chi" data-xi="${xi}">${g.swatch ? `<input type="color" data-f="color" value="${esc(c.color || SWATCH[c.id] || '#cccccc')}" aria-label="${esc(c.label)} color">` : ''}<input data-f="choice" value="${esc(c.label)}" aria-label="Choice name"><button type="button" data-del="choice" aria-label="Remove ${esc(c.label)}">×</button></span>`).join('') || '<em class="hint">No choices yet.</em>'}</div>
+    <div class="addrow"><input data-newchoice placeholder="Add a choice, e.g. Navy" aria-label="New choice"><button class="btn out" type="button" data-addchoice>Add</button></div></div>`;
+  const pieceHTML = (it, ci, ii, n) => `<details class="pedit" data-ci="${ci}" data-ii="${ii}" ${opened.has(it) ? 'open' : ''}>
+    <summary><span class="ph">${drawFor(it)}</span><span class="pn"><b>${esc(it.label || 'Untitled piece')}</b><small>${it.groups.map(g => `${esc(g.label)} (${g.choices.length})`).join(' · ') || 'no options'}</small></span>${tools('piece', ii, n)}</summary>
+    <div class="pbody">
+      <div class="two"><div class="field"><label class="lbl">Piece name</label><input data-f="piece" value="${esc(it.label)}" placeholder="e.g. Wine glass"></div>
+        <div class="field"><label class="lbl">Material line <span class="hint">optional, shown under the pieces</span></label><input data-f="material" value="${esc(it.material || '')}" placeholder="e.g. crystal"></div></div>
+      <div class="two"><div class="field"><label class="lbl">Preview when there's no photo</label><select data-f="preview">${DRAW.map(([k, l]) => `<option value="${k}" ${it.preview === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+        <div class="field"><label class="lbl">Category</label><select data-movecat>${cat.categories.map((c, j) => `<option value="${j}" ${j === ci ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}</select></div></div>
+      <h4 class="gtitle">Option groups <span class="hint">guests pick one of each, in this order</span></h4>
+      ${it.groups.map((g, gi) => groupHTML(g, gi, it.groups.length)).join('') || '<p class="hint">No options: guests pick the piece and add a name.</p>'}
+      <button class="btn out addg" type="button" data-addgroup>+ Add option group</button>
+    </div></details>`;
+  const drawFor = it => { const sg = it.groups.find(g => g.swatch), c0 = sg?.choices[0];
+    return window.EngravePreview.renderPreview({ item: it.preview || 'card', color: c0?.id, hex: c0?.color, addon: 'none', name: '', font: 'script' }); };
+
+  function render() {
+    const y = scrollY;
+    $app.innerHTML = `${staffHead('catalog', 'catalog')}<main class="wrap catalog">
+      <h1>the <em>catalog</em></h1>
+      <p class="hint">Categories hold pieces. Each piece has its own option groups (finish, size, detail…), shown to guests in this order. Every event picks which pieces and choices it offers in <a href="#/admin">Event setup</a>. Photos follow each piece's first two groups.</p>
+      ${cat.categories.map((c, ci) => `<section class="catsec" data-ci="${ci}">
+        <div class="cathdr"><label class="vh">Category name</label><input class="catname" data-f="cat" value="${esc(c.label)}" placeholder="Category name">${tools('cat', ci, cat.categories.length)}</div>
+        ${c.items.map((it, ii) => pieceHTML(it, ci, ii, c.items.length)).join('') || '<p class="hint">No pieces in this category yet.</p>'}
+        <button class="btn out addp" type="button" data-addpiece>+ Add a piece to ${esc(c.label || 'this category')}</button></section>`).join('')}
+      <button class="btn out" type="button" id="addcat" style="width:100%;margin-top:18px">+ Add category</button>
+    </main>
+    <div class="savebar"><span id="dirty">${dirty ? 'Unsaved changes' : 'All changes saved'}</span><button class="btn" id="save" type="button" ${dirty ? '' : 'disabled'}>Save catalog</button></div>`;
+    bind(); scrollTo(0, y);
+  }
+  const markDirty = () => { dirty = true; document.getElementById('dirty').textContent = 'Unsaved changes'; document.getElementById('save').disabled = false; };
+  const change = fn => e => { fn(e); dirty = true; render(); };
+  function bind() {
+    bindStaffHead();
+    document.querySelectorAll('details.pedit').forEach(d => d.ontoggle = () => { const { it } = at(d); d.open ? opened.add(it) : opened.delete(it); });
+    document.querySelectorAll('[data-f]').forEach(inp => {
+      const ev = inp.tagName === 'SELECT' ? 'onchange' : 'oninput';
+      inp[ev] = () => {
+        const f = inp.dataset.f, v = inp.value;
+        if (f === 'cat') at(inp).c.label = v;
+        else if (f === 'piece') at(inp).it.label = v;
+        else if (f === 'material') at(inp).it.material = v;
+        else if (f === 'preview') { at(inp).it.preview = v; dirty = true; render(); return; }
+        else if (f === 'group') grp(inp).label = v;
+        else if (f === 'choice') grp(inp).choices[+inp.closest('[data-xi]').dataset.xi].label = v;
+        else if (f === 'color') grp(inp).choices[+inp.closest('[data-xi]').dataset.xi].color = v;
+        markDirty();
+      };
+    });
+    document.querySelectorAll('[data-swatch]').forEach(cb => cb.onchange = change(() => { const g = grp(cb); g.swatch = cb.checked; if (g.swatch) g.choices.forEach(c => { c.color = c.color || SWATCH[c.id] || '#cccccc'; }); }));
+    document.querySelectorAll('[data-movecat]').forEach(sel => sel.onchange = change(() => { const { c, it } = at(sel); c.items.splice(c.items.indexOf(it), 1); cat.categories[+sel.value].items.push(it); opened.add(it); }));
+    const addChoice = el => { const box = el.closest('.gedit'), inp = box.querySelector('[data-newchoice]'), label = inp.value.trim(); if (!label) { inp.focus(); return; }
+      const g = grp(el); if (g.choices.some(c => c.label.toLowerCase() === label.toLowerCase())) { toast(`${label} is already there`); return; }
+      g.choices.push({ label, _new: true, ...(g.swatch ? { color: '#cccccc' } : {}) }); dirty = true;
+      const gi = box.dataset.gi, ci = box.closest('[data-ci]').dataset.ci, ii = box.closest('[data-ii]').dataset.ii; render();
+      document.querySelector(`[data-ci="${ci}"][data-ii="${ii}"] [data-gi="${gi}"] [data-newchoice]`)?.focus(); };
+    document.querySelectorAll('[data-addchoice]').forEach(b => b.onclick = () => addChoice(b));
+    document.querySelectorAll('[data-newchoice]').forEach(i => i.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addChoice(i); } });
+    document.querySelectorAll('[data-addgroup]').forEach(b => b.onclick = change(() => { at(b).it.groups.push({ label: '', swatch: false, choices: [], _new: true }); }));
+    document.querySelectorAll('[data-addpiece]').forEach(b => b.onclick = () => { const it = { label: '', material: '', preview: 'card', groups: [], _new: true }; at(b).c.items.push(it); opened.add(it); dirty = true; render(); [...document.querySelectorAll('details.pedit')].find(d => at(d).it === it)?.querySelector('[data-f="piece"]').focus(); });
+    document.getElementById('addcat').onclick = change(() => { cat.categories.push({ label: '', items: [], _new: true }); });
+    const nav = (b, d) => { const kind = b.dataset.up || b.dataset.down; const { c, it } = at(b);
+      if (kind === 'cat') move(cat.categories, cat.categories.indexOf(c), d);
+      else if (kind === 'piece') move(c.items, c.items.indexOf(it), d);
+      else if (kind === 'group') move(it.groups, +b.closest('[data-gi]').dataset.gi, d); };
+    document.querySelectorAll('[data-up]').forEach(b => b.onclick = e => { e.preventDefault(); nav(b, -1); dirty = true; render(); });
+    document.querySelectorAll('[data-down]').forEach(b => b.onclick = e => { e.preventDefault(); nav(b, 1); dirty = true; render(); });
+    document.querySelectorAll('[data-del]').forEach(b => b.onclick = e => {
+      e.preventDefault(); const kind = b.dataset.del, { c, it } = at(b);
+      if (kind === 'cat') { if (c.items.length && !confirm(`Delete ${c.label || 'this category'} and its ${c.items.length} piece(s)? Events that offer them will stop showing them.`)) return; cat.categories.splice(cat.categories.indexOf(c), 1); }
+      else if (kind === 'piece') { if (!it._new && !confirm(`Delete ${it.label}? Events that offer it will stop showing it. Past orders keep their details.`)) return; c.items.splice(c.items.indexOf(it), 1); }
+      else if (kind === 'group') it.groups.splice(+b.closest('[data-gi]').dataset.gi, 1);
+      else if (kind === 'choice') grp(b).choices.splice(+b.closest('[data-xi]').dataset.xi, 1);
+      dirty = true; render();
+    });
+    document.getElementById('save').onclick = save;
+  }
+  // New things get a permanent id from their name when first saved; existing ids never change.
+  const uniq = (label, taken, fallback) => { const b = slug(label) || fallback; let id = b; for (let n = 2; taken.has(id); n++) id = `${b}-${n}`; taken.add(id); return id; };
+  async function save() {
+    if (saving || !dirty) return;
+    const problems = [];
+    cat.categories.forEach(c => { if (!c.label.trim()) problems.push('A category needs a name.');
+      c.items.forEach(it => { const nm = it.label.trim() || 'A piece'; if (!it.label.trim()) problems.push('A piece needs a name.');
+        it.groups.forEach(g => { if (!g.label.trim()) problems.push(`${nm}: an option group needs a name.`); if (!g.choices.length) problems.push(`${nm}: ${g.label || 'an option group'} needs at least one choice.`);
+          if (g.choices.some(x => !x.label.trim())) problems.push(`${nm}: a choice under ${g.label} has no name.`); }); }); });
+    if (problems.length) { toast(problems[0]); return; }
+    const catIds = new Set(cat.categories.filter(c => !c._new).map(c => c.id)), pieceIds = new Set(cat.categories.flatMap(c => c.items).filter(i => !i._new).map(i => i.id));
+    const clean = cat.categories.map(c => ({ id: c._new ? uniq(c.label, catIds, 'category') : c.id, label: c.label.trim(),
+      items: c.items.map(it => { const gIds = new Set(it.groups.filter(g => !g._new).map(g => g.id));
+        return { id: it._new ? uniq(it.label, pieceIds, 'piece') : it.id, label: it.label.trim(), material: (it.material || '').trim(), preview: it.preview || 'card',
+          groups: it.groups.map(g => { const xIds = new Set(g.choices.filter(x => !x._new).map(x => x.id));
+            return { id: g._new ? uniq(g.label, gIds, 'option') : g.id, label: g.label.trim(), swatch: !!g.swatch,
+              choices: g.choices.map(x => ({ id: x._new ? uniq(x.label, xIds, 'choice') : x.id, label: x.label.trim(), ...(g.swatch && x.color ? { color: x.color } : {}) })) }; }) }; }) }));
+    saving = true; const b = document.getElementById('save'); b.disabled = true; b.textContent = 'Saving…';
+    try {
+      await setDoc(doc(db, 'config', 'catalog'), { categories: clean, updatedAt: serverTimestamp(), by: user.email });
+      CAT = { categories: clean }; catLoading = Promise.resolve();
+      const added = clean.flatMap(c => c.items).filter(i => !pieceIds.has(i.id));
+      dirty = false; toast(added.length ? `Saved. Turn ${added.map(i => i.label).join(', ')} on in each event's setup to offer it.` : 'Catalog saved');
+      catalogPage();
+    } catch (err) { toast('Could not save: ' + (err.code || err.message)); b.disabled = false; }
+    finally { saving = false; b.textContent = 'Save catalog'; }
+  }
+  const leave = e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } };
+  addEventListener('beforeunload', leave); unsubs.push(() => removeEventListener('beforeunload', leave));
+  render();
+}
+
+// ---------- photo library ----------
 // Phone photos shrink to a small JPEG stored in Firestore (the free plan has no file storage).
 async function fileToJpeg(file, max = 720) {
   const src = URL.createObjectURL(file);
@@ -675,27 +888,39 @@ async function fileToJpeg(file, max = 720) {
     return out;
   } finally { URL.revokeObjectURL(src); }
 }
-
+function photoSlots(it) {
+  const [g1, g2] = it.groups;
+  if (!g1) return [{ key: it.id, opts: {}, label: 'Any' }];
+  return g1.choices.flatMap(c1 => {
+    if (!g2) return [{ key: `${it.id}_${c1.id}`, opts: { [g1.id]: c1.id }, label: c1.label }];
+    const none = g2.choices.find(c => c.id === 'none');
+    return [{ key: `${it.id}_${c1.id}`, opts: { [g1.id]: c1.id, [g2.id]: 'none' }, label: `${c1.label} · ${none ? none.label.toLowerCase() : 'any ' + g2.label.toLowerCase()}` },
+      ...g2.choices.filter(c => c.id !== 'none').map(c2 => ({ key: `${it.id}_${c1.id}_${c2.id}`, opts: { [g1.id]: c1.id, [g2.id]: c2.id }, label: `${c1.label} · ${c2.label.toLowerCase()}` }))];
+  });
+}
 async function photosPage() {
-  const slots = allItems().flatMap(([item, v]) => Object.entries(v.colors).flatMap(([color, cLabel]) =>
-    Object.entries(v.addons).map(([addon, aLabel]) => ({ item, color, addon, key: addon === 'none' ? `${item}_${color}` : `${item}_${color}_${addon}`, label: `${cLabel} · ${aLabel.toLowerCase()}` }))));
   $app.innerHTML = staffLoading('Loading photos…');
+  await loadCatalog(true);
+  const pieces = allPieces().map(p => ({ ...p, slots: photoSlots(p.it).map(s => ({ ...s, item: p.it.id })) }));
+  const slots = pieces.flatMap(p => p.slots);
   await Promise.all(slots.map(s => getDoc(doc(db, 'photos', s.key)).then(d => { photoLib[s.key] = d.exists() ? (d.data().data || null) : null; }).catch(() => {})));
   const busy = new Set();
+  const drawn = s => { const p = pieceDef(s.item), sg = p.it.groups.find(g => g.swatch), ch = sg && sg.choices.find(c => c.id === s.opts[sg.id]);
+    return window.EngravePreview.renderPreview({ item: p.it.preview || 'card', color: sg ? s.opts[sg.id] : undefined, hex: ch?.color, addon: Object.values(s.opts).find(v => v === 'stars' || v === 'heart') || 'none', name: '', font: 'script' }); };
   const tile = s => {
     const has = typeof photoLib[s.key] === 'string', up = busy.has(s.key);
-    return `<figure class="ptile" data-key="${s.key}"><div class="pimg ${has ? '' : 'none'}">${has ? `<img src="${esc(photoLib[s.key])}" alt="">` : window.EngravePreview.renderPreview({ item: s.item === 'tumbler' ? 'tumbler' : 'bagtag', color: s.color, addon: s.addon, name: '', font: 'script' })}${has ? '' : '<span class="tag">no photo yet</span>'}</div>
-      <figcaption>${esc(s.label)}</figcaption><div class="acts"><label class="up ${up ? 'busy' : ''}">${up ? 'Uploading…' : has ? 'Replace' : 'Add photo'}<input type="file" accept="image/*" data-up="${s.key}" ${up ? 'disabled' : ''}></label>
-      ${has && !up ? `<button class="rm" type="button" data-del="${s.key}" aria-label="Remove photo">×</button>` : ''}</div></figure>`;
+    return `<figure class="ptile" data-key="${esc(s.key)}"><div class="pimg ${has ? '' : 'none'}">${has ? `<img src="${esc(photoLib[s.key])}" alt="">` : drawn(s)}${has ? '' : '<span class="tag">no photo yet</span>'}</div>
+      <figcaption>${esc(s.label)}</figcaption><div class="acts"><label class="up ${up ? 'busy' : ''}">${up ? 'Uploading…' : has ? 'Replace' : 'Add photo'}<input type="file" accept="image/*" data-upload="${esc(s.key)}" ${up ? 'disabled' : ''}></label>
+      ${has && !up ? `<button class="rm" type="button" data-remove="${esc(s.key)}" aria-label="Remove photo">×</button>` : ''}</div></figure>`;
   };
   function render() {
-    const n = slots.filter(s => typeof photoLib[s.key] === 'string').length;
-    $app.innerHTML = `${staffHead('photos')}<main class="wrap"><h1>example <em>photos</em></h1>
-      <p class="hint">${n} of ${slots.length} added. Guests see these when they pick a finish and detail; without one they see a drawn preview. Every event uses this library. Shoot in portrait with the piece centered.</p>
-      ${allItems().map(([item, v]) => `<h2 class="sec">${esc(v.label.toLowerCase())}</h2><div class="pgrid">${slots.filter(s => s.item === item).map(tile).join('')}</div>`).join('')}</main>`;
-    bindStaffHead();
-    document.querySelectorAll('[data-up]').forEach(inp => inp.onchange = async () => {
-      const f = inp.files && inp.files[0]; if (!f) return; const key = inp.dataset.up;
+    const y = scrollY, n = slots.filter(s => typeof photoLib[s.key] === 'string').length;
+    $app.innerHTML = `${staffHead('photos', 'photos')}<main class="wrap"><h1>example <em>photos</em></h1>
+      <p class="hint">${n} of ${slots.length} added. Guests see these as they choose; without one they see a drawn preview. Every event uses this library. Shoot in portrait with the piece centered. Pieces and choices come from the <a href="#/catalog">catalog</a>.</p>
+      ${pieces.map(p => `<h2 class="sec">${esc(p.it.label.toLowerCase())} <small>${esc(p.cat.label)}</small></h2><div class="pgrid">${p.slots.map(tile).join('')}</div>`).join('') || '<p class="note">The catalog has no pieces yet.</p>'}</main>`;
+    bindStaffHead(); scrollTo(0, y);
+    document.querySelectorAll('[data-upload]').forEach(inp => inp.onchange = async () => {
+      const f = inp.files && inp.files[0]; if (!f) return; const key = inp.dataset.upload;
       busy.add(key); render();
       try {
         const data = await fileToJpeg(f);
@@ -704,8 +929,8 @@ async function photosPage() {
       } catch (err) { toast('Could not save that photo: ' + (err.code || err.message || 'unreadable image')); }
       finally { busy.delete(key); render(); }
     });
-    document.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
-      const key = b.dataset.del, old = photoLib[key];
+    document.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
+      const key = b.dataset.remove, old = photoLib[key];
       try {
         await deleteDoc(doc(db, 'photos', key)); photoLib[key] = null; render();
         toast('Photo removed', { label: 'Undo', run: () => setDoc(doc(db, 'photos', key), { data: old, updatedAt: serverTimestamp(), by: user.email }).then(() => { photoLib[key] = old; render(); }) });

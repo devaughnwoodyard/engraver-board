@@ -12,6 +12,15 @@
     terracotta: { base: '#b9623f', hi: '#d27b56', engrave: '#e9e2da' }
   };
 
+  // Custom catalog colors: derive a palette from one hex value.
+  const isHex = h => /^#[0-9a-f]{6}$/i.test(h || '');
+  function shade(hex, amt) {
+    const n = parseInt(hex.slice(1), 16), f = v => Math.max(0, Math.min(255, Math.round(amt < 0 ? v * (1 + amt) : v + (255 - v) * amt)));
+    return '#' + [n >> 16, (n >> 8) & 255, n & 255].map(v => f(v).toString(16).padStart(2, '0')).join('');
+  }
+  function lum(hex) { const n = parseInt(hex.slice(1), 16); return (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255; }
+  function fromHex(hex) { const light = lum(hex) > 0.6; return { base: hex, hi: shade(hex, 0.18), engrave: light ? shade(hex, -0.45) : shade(hex, 0.6), stitch: shade(hex, light ? -0.2 : 0.45) }; }
+
   const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
   function star(cx, cy, r, fill) {
@@ -39,8 +48,8 @@
     return Math.min(max, (width / n) * 1.9);
   }
 
-  function bagTag({ color = 'black', addon = 'none', name = '', font = 'script' }) {
-    const c = LEATHER[color] || LEATHER.black;
+  function bagTag({ color = 'black', hex, addon = 'none', name = '', font = 'script' }) {
+    const c = LEATHER[color] || (isHex(hex) ? fromHex(hex) : LEATHER.black);
     const fam = font === 'serif' ? "'Simonetta', serif" : "'Great Vibes', cursive";
     const fs = nameSize(name, font === 'serif' ? 50 : 66, 190);
     const cx = 300, cy = 450;
@@ -70,14 +79,15 @@
 </svg>`;
   }
 
-  function tumbler({ color = 'black', addon = 'none', name = '', font = 'script' }) {
-    const c = TUMBLER[color] || TUMBLER.black;
+  function tumbler({ color = 'black', hex, addon = 'none', name = '', font = 'script' }) {
+    const c = TUMBLER[color] || (isHex(hex) ? fromHex(hex) : TUMBLER.black);
+    const light = TUMBLER[color] ? color === 'white' : lum(c.base) > 0.6;
     const fam = font === 'serif' ? "'Simonetta', serif" : "'Great Vibes', cursive";
     const fs = nameSize(name, font === 'serif' ? 48 : 64, 170);
     const cx = 300, cy = 440;
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 800">
 <defs>
- <linearGradient id="body" x1="0" x2="1"><stop offset="0" stop-color="${c.base}"/><stop offset=".22" stop-color="${c.hi}"/><stop offset=".4" stop-color="${c.base}"/><stop offset=".85" stop-color="${c.base}"/><stop offset="1" stop-color="#000" stop-opacity="${color === 'white' ? '.25' : '.9'}"/></linearGradient>
+ <linearGradient id="body" x1="0" x2="1"><stop offset="0" stop-color="${c.base}"/><stop offset=".22" stop-color="${c.hi}"/><stop offset=".4" stop-color="${c.base}"/><stop offset=".85" stop-color="${c.base}"/><stop offset="1" stop-color="#000" stop-opacity="${light ? '.25' : '.9'}"/></linearGradient>
  <linearGradient id="steel" x1="0" x2="1"><stop offset="0" stop-color="#8d8f93"/><stop offset=".25" stop-color="#f4f4f2"/><stop offset=".55" stop-color="#b6b8bb"/><stop offset="1" stop-color="#6d6f73"/></linearGradient>
  <linearGradient id="engr" x1="0" x2="1"><stop offset="0" stop-color="${c.engrave}" stop-opacity=".75"/><stop offset=".3" stop-color="${c.engrave}"/><stop offset="1" stop-color="${c.engrave}" stop-opacity=".7"/></linearGradient>
  <filter id="sh" x="-40%" y="-20%" width="180%" height="140%"><feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#3b2418" flood-opacity=".26"/></filter>
@@ -98,10 +108,25 @@
 </svg>`;
   }
 
+  // Pieces without a drawing of their own (calligraphy, new items): a card with the name on it.
+  function card({ hex, addon = 'none', name = '', font = 'script' }) {
+    const paper = isHex(hex) ? hex : '#fffdf8', ink = lum(paper) > 0.5 ? '#3a2a20' : '#f4ead8';
+    const fam = font === 'serif' ? "'Simonetta', serif" : "'Great Vibes', cursive";
+    const fs = nameSize(name, font === 'serif' ? 54 : 72, 330);
+    const cx = 300, cy = 410;
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 800">
+<defs><filter id="sh" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#3b2418" flood-opacity=".22"/></filter></defs>
+<rect width="600" height="800" fill="#fff8f0"/>
+<g transform="rotate(-3 300 410)"><rect x="90" y="250" width="420" height="320" rx="6" fill="${paper}" filter="url(#sh)"/>
+<rect x="110" y="270" width="380" height="280" fill="none" stroke="${ink}" stroke-opacity=".25"/>
+<g fill="${ink}">${addonMarks(addon, cx, cy, 130, ink)}${name ? `<text x="${cx}" y="${cy + fs * 0.3}" text-anchor="middle" font-family="${fam}" font-size="${fs.toFixed(0)}">${esc(name)}</text>` : ''}</g></g>
+</svg>`;
+  }
+
   // Each inline SVG needs its own gradient/filter ids, or every copy on a page borrows the first one's colors.
   let seq = 0;
   function renderPreview(opts) {
-    const svg = opts.item === 'tumbler' ? tumbler(opts) : bagTag(opts);
+    const svg = opts.item === 'tumbler' ? tumbler(opts) : opts.item === 'card' ? card(opts) : bagTag(opts);
     const u = 'p' + (++seq) + '_';
     return svg.replace(/id="([\w-]+)"/g, 'id="' + u + '$1"').replace(/url\(#([\w-]+)\)/g, 'url(#' + u + '$1)');
   }

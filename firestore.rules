@@ -15,6 +15,12 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Shared catalog (categories, pieces, options): everyone reads it, staff edit it.
+    match /config/{docId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
     // Example photo library (small JPEGs stored inline), shown to guests at every event.
     match /photos/{key} {
       allow read: if true;
