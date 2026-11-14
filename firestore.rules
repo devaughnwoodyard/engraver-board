@@ -17,13 +17,16 @@ service cloud.firestore {
 
     // Event setup (items, options, engravers): public read so the guest form can render.
     match /events/{eventId} {
+      // The practice event: anyone with the link can work its board and reset its orders, no staff sign-in.
+      function isDemo() { return eventId == 'demo' && request.auth != null; }
+
       allow read: if true;
       allow write: if isStaff();
 
       // Public queue snapshot the board maintains, so guests can see their position.
       match /public/{docId} {
         allow read: if true;
-        allow write: if isStaff();
+        allow write: if isStaff() || isDemo();
         // A guest may add only their own new order to the bottom of the line, in the same batch that creates it.
         allow create, update: if docId == 'queue' && request.auth != null
           && request.resource.data.keys().hasOnly(['ids', 'updatedAt'])
@@ -41,10 +44,10 @@ service cloud.firestore {
           && request.resource.data.name is string
           && request.resource.data.name.size() <= 40;
         // Guests read only their own order; staff read everything.
-        allow read: if isStaff()
+        allow read: if isStaff() || isDemo()
           || (request.auth != null && resource.data.uid == request.auth.uid);
         // Only staff move or remove cards.
-        allow update, delete: if isStaff();
+        allow update, delete: if isStaff() || isDemo();
       }
     }
   }

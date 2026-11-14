@@ -106,7 +106,7 @@ function route() {
   window.scrollTo(0, 0);
   if (view === 'e' && a) return guestForm(a);
   if (view === 'o' && a && b) return statusPage(a, b);
-  if (view === 'board' && a) return staffGate(() => boardPage(a));
+  if (view === 'board' && a) return a === DEMO_ID ? ensureGuest().then(() => boardPage(a)) : staffGate(() => boardPage(a));
   if (view === 'admin') return staffGate(adminPage);
   return homePage();
 }
@@ -116,7 +116,10 @@ function homePage() {
   $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">ivelisse board</div>${WAVE(390)}</header>
     <main class="content"><div class="rule"></div><h1>live <em>personalization</em></h1>
     <p class="note">Guests reach their event by scanning its QR code. Staff manage events and boards here.</p>
-    <a class="btn" href="#/admin">Staff: events &amp; boards</a></main></div>`;
+    <a class="btn" href="#/board/demo">Try the demo board</a>
+    <a class="btn out" href="#/e/demo">Try the guest form</a>
+    <p class="note" style="font-size:.8125rem">The demo has sample orders and no sign-in. Use "reset demo" on the board to start over.</p>
+    <a class="btn out" href="#/admin">Staff: events &amp; boards</a></main></div>`;
 }
 
 // ---------- guest form ----------
@@ -332,7 +335,7 @@ async function resetDemo() {
   const old = await getDoc(evRef).catch(() => null);
   const prev = old && old.exists() ? old.data() : null;
   const today = new Date(); const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-  await setDoc(evRef, { name: 'Demo event', date, engravers: DEMO_ENGRAVERS, items: { bagtag: true, tumbler: true }, services: ['engraving'], catalog: DEFAULT_CATALOG,
+  if (await isStaff()) await setDoc(evRef, { name: 'Demo event', date, engravers: DEMO_ENGRAVERS, items: { bagtag: true, tumbler: true }, services: ['engraving'], catalog: DEFAULT_CATALOG,
     photos: prev?.photos || {}, pickupNote: prev?.pickupNote || 'at the engraving table', open: true, demo: true, createdAt: prev?.createdAt || serverTimestamp() });
   // Clear every order in the demo event.
   const snap = await getDocs(collection(db, 'events', DEMO_ID, 'orders'));
