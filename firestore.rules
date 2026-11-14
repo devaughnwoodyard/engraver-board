@@ -15,6 +15,13 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Example photo library (small JPEGs stored inline), shown to guests at every event.
+    match /photos/{key} {
+      allow read: if true;
+      allow create, update: if isStaff() && request.resource.data.data is string && request.resource.data.data.size() < 900000;
+      allow delete: if isStaff();
+    }
+
     // Event setup (items, options, engravers): public read so the guest form can render.
     match /events/{eventId} {
       // The practice event: anyone with the link can work its board and reset its orders, no staff sign-in.

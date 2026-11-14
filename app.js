@@ -2,7 +2,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/fireba
 import { getAuth, signInAnonymously, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   initializeFirestore, persistentLocalCache, persistentSingleTabManager, memoryLocalCache,
-  doc, collection, setDoc, updateDoc, getDoc, getDocs, onSnapshot, query, orderBy, serverTimestamp, writeBatch, arrayUnion, getDocFromServer, Timestamp
+  doc, collection, setDoc, updateDoc, getDoc, getDocs, onSnapshot, query, orderBy, serverTimestamp, writeBatch, arrayUnion, getDocFromServer, Timestamp, deleteDoc
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { firebaseConfig } from './firebase-config.js';
 
@@ -43,7 +43,7 @@ const fmtDate = d => { if (!d) return ''; const t = new Date(d + 'T12:00:00'); r
 const fmtTime = d => d ? d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase() : '';
 const tsDate = t => (t && typeof t.toDate === 'function') ? t.toDate() : (typeof t === 'number' ? new Date(t) : null);
 let unsubs = [], timers = [];
-const cleanup = () => { unsubs.forEach(u => { try { u(); } catch (e) {} }); unsubs = []; timers.forEach(clearInterval); timers = []; };
+const cleanup = () => { photoRerender = null; unsubs.forEach(u => { try { u(); } catch (e) {} }); unsubs = []; timers.forEach(clearInterval); timers = []; };
 function toast(msg, action) {
   document.querySelectorAll('.toast').forEach(t => t.remove());
   const t = document.createElement('div'); t.className = 'toast'; t.setAttribute('role', 'status');
@@ -58,7 +58,25 @@ function driveToDirect(url) {
 }
 function catalog(ev) { return (ev && ev.catalog) || DEFAULT_CATALOG; }
 function itemDef(ev, key) { for (const s of Object.values(catalog(ev))) if (s.items && s.items[key]) return s.items[key]; return null; }
-function photoFor(ev, o) { const p = (ev && ev.photos) || {}; return p[`${o.item}_${o.color}_${o.addon}`] || p[`${o.item}_${o.color}`] || p[o.item] || null; }
+// Example photos live in /photos/{key}, shared by every event (key: item_color or item_color_addon).
+// Each is fetched the first time a screen needs it, so a guest's phone only downloads what it shows.
+const photoLib = {};       // key -> image data URL, or null once we know there is none
+let photoRerender = null;  // the open page's redraw, run when a photo arrives
+let photoTimer = null;
+function requestPhoto(key) {
+  if (key in photoLib) return;
+  photoLib[key] = undefined;
+  getDoc(doc(db, 'photos', key)).then(s => {
+    photoLib[key] = s.exists() ? (s.data().data || null) : null;
+    if (photoLib[key]) { clearTimeout(photoTimer); photoTimer = setTimeout(() => photoRerender && photoRerender(), 60); }
+  }).catch(() => { photoLib[key] = null; });
+}
+function photoFor(ev, o) {
+  const p = (ev && ev.photos) || {}; // older events may still hold pasted photo links
+  const keys = [...new Set([o.addon && o.addon !== 'none' ? `${o.item}_${o.color}_${o.addon}` : null, `${o.item}_${o.color}`, o.item].filter(Boolean))];
+  for (const k of keys) { if (p[k]) return p[k]; requestPhoto(k); if (photoLib[k]) return photoLib[k]; }
+  return null;
+}
 function previewHTML(ev, o, withName = true) {
   const photo = photoFor(ev, o);
   if (photo) return `<img src="${esc(photo)}" alt="" loading="lazy">`;
@@ -107,7 +125,8 @@ function route() {
   if (view === 'e' && a) return guestForm(a);
   if (view === 'o' && a && b) return statusPage(a, b);
   if (view === 'board' && a) return a === DEMO_ID ? ensureGuest().then(() => boardPage(a)) : staffGate(() => boardPage(a));
-  if (view === 'admin') return staffGate(adminPage);
+  if (view === 'admin') return staffGate(() => a ? setupPage(a) : adminPage());
+  if (view === 'photos') return staffGate(photosPage);
   return homePage();
 }
 addEventListener('hashchange', route);
@@ -225,6 +244,8 @@ async function guestForm(eventId) {
     rememberOrder(eventId, { id: ref.id, name });
     location.hash = `#/o/${encodeURIComponent(eventId)}/${ref.id}`;
   }
+  // A photo arriving mid-typing only swaps the preview, so the name field keeps focus.
+  photoRerender = () => { if (document.activeElement?.id === 'nm') { const pv = document.getElementById('pv'); if (pv) pv.innerHTML = previewHTML(ev, st); } else render(); };
   render();
 }
 
@@ -308,6 +329,7 @@ async function statusPage(eventId, orderId) {
   refresh();
   let tick = 0;
   timers.push(setInterval(() => { tick++; refresh(tick % 2 === 0); }, 5000));
+  photoRerender = render;
   render();
 }
 
@@ -408,7 +430,7 @@ async function boardPage(eventId) {
         <div class="k"><span><b>${n.q}</b>waiting</span><span><b>${n.p}</b>engraving</span><span><b>${n.x}</b>picked up</span>
           <button class="pu" id="openpk" type="button">${n.r} to pick up ›</button>
           <span class="lv ${online() ? '' : 'off'}"><i aria-hidden="true"></i>${online() ? 'Live' : 'Offline • moves save on this iPad'}</span>
-          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}<a href="#/admin">events</a></div>${WAVE(1180)}</header>
+          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}<a href="#/admin/${encodeURIComponent(eventId)}">event setup</a><a href="#/admin">all events</a></div>${WAVE(1180)}</header>
       <main class="lanes" style="--n:${engravers().length}">
         <section class="lane" aria-label="Queue"><h2>queue <small>first in line at the top</small></h2>
           <div class="drop" data-status="queue" data-engraver="">${q.map((o, i) => queueCard(o, free, i)).join('') || '<p class="note">No one waiting.</p>'}</div></section>
@@ -471,6 +493,7 @@ async function boardPage(eventId) {
     if (status === 'picked') patch.pickedAt = serverTimestamp();
     updateDoc(doc(db, 'events', eventId, 'orders', id), patch).catch(e => { toast('That move did not save: ' + (e.code || e.message)); });
   }
+  photoRerender = render;
   render();
 }
 
@@ -494,83 +517,194 @@ async function exportOrders(eventId, ev) {
   toast(`${rows.length} orders exported. In Google Sheets: File → Import → Upload.`);
 }
 
-// ---------- admin ----------
+// ---------- staff: events list, event setup, photo library ----------
+const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+const allItems = () => Object.values(DEFAULT_CATALOG).flatMap(s => Object.entries(s.items));
+const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const guestUrl = id => `${baseUrl()}#/e/${encodeURIComponent(id)}`;
+const qrSvg = url => { const q = qrcode(0, 'M'); q.addData(url); q.make(); return q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }); };
+function downloadQr(url, name) { const q = qrcode(0, 'M'); q.addData(url); q.make(); const l = document.createElement('a'); l.href = q.createDataURL(12, 4); l.download = `qr-${name}.gif`; l.click(); }
+const staffHead = title => `<header class="band">${LOGO}<div class="ev">${esc(title)}</div>${WAVE(1180)}</header>
+  <nav class="snav" aria-label="Staff"><a href="#/admin">Events</a><a href="#/photos">Photos</a><span>${esc(user.email)}</span><a href="#" id="out">Sign out</a></nav>`;
+function bindStaffHead() { const o = document.getElementById('out'); if (o) o.onclick = e => { e.preventDefault(); signOut(auth).then(() => { location.hash = '#/'; }); }; }
+const staffLoading = msg => `<div class="page"><p class="note" style="padding:40px">${esc(msg)}</p></div>`;
+
 async function adminPage() {
-  const slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-  let evs = [];
-  async function load() {
-    const snap = await getDocs(collection(db, 'events'));
-    evs = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
-    render();
-  }
-  const itemChecks = ev => Object.values(DEFAULT_CATALOG).flatMap(s => Object.entries(s.items).map(([k, v]) =>
-    `<label><input type="checkbox" name="item" value="${k}" ${!ev || ev.items?.[k] !== false ? 'checked' : ''}> ${esc(v.label)}</label>`)).join('');
-  const photosText = ev => Object.entries(ev?.photos || {}).map(([k, v]) => `${k} = ${v}`).join('\n');
-  function render() {
-    $app.innerHTML = `<header class="band">${LOGO}<div class="ev">${esc(user.email)} · <a href="#" id="out" style="color:#fff">sign out</a></div>${WAVE(1180)}</header>
-      <div class="wrap"><h1 style="text-align:left">your <em>events</em></h1>
-      ${evs.some(e => e.id === DEMO_ID) ? '' : `<p class="note" style="text-align:left;margin:12px 0 4px">Want to try it out first? A demo event comes with sample orders in every stage.</p><button class="btn out" id="mkdemo" type="button">Create demo event</button>`}
-      <details ${evs.length ? '' : 'open'} style="margin-top:12px"><summary class="lbl" style="cursor:pointer;min-height:44px;display:flex;align-items:center;color:var(--ink)">+ New event</summary>
-        <form id="new">
-          <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
-          <div class="field"><label class="lbl" for="n-date">Date</label><input id="n-date" type="date" required></div>
-          <div class="field"><label class="lbl" for="n-eng">Engravers (comma separated)</label><input id="n-eng" value="Steph, Veronica, Christina, DeVaughn"></div>
-          <div class="field"><label class="lbl" for="n-pick">Where guests pick up</label><input id="n-pick" value="at the engraving table"></div>
-          <div class="field"><span class="lbl">Items offered</span><div class="checks">${itemChecks(null)}</div></div>
-          <button class="btn" style="width:100%">Create event</button>
-        </form></details>
-      ${evs.map(ev => {
-        const url = `${baseUrl()}#/e/${encodeURIComponent(ev.id)}`;
-        return `<div class="event" data-id="${esc(ev.id)}"><div class="qr" data-url="${esc(url)}"></div>
-          <div class="info"><h2>${esc(ev.name)}</h2><div style="color:var(--muted)">${esc(fmtDate(ev.date))} · ${(ev.engravers || []).map(esc).join(', ')}${ev.open === false ? ' · <b>closed</b>' : ''}</div>
-            <div class="links"><a href="#/board/${encodeURIComponent(ev.id)}">Open board</a><a href="#/e/${encodeURIComponent(ev.id)}">Guest form</a><a href="#" data-copy="${esc(url)}">Copy guest link</a><a href="#" data-qr="${esc(ev.id)}">Download QR</a><a href="#" data-export="${esc(ev.id)}">Export orders (Sheets)</a>${ev.id === DEMO_ID ? '<a href="#" data-resetdemo><b>Reset demo</b></a>' : ''}</div>
-            <details><summary class="lbl" style="cursor:pointer;min-height:44px;display:flex;align-items:center;color:var(--ink)">Edit</summary>
-              <div class="field"><label class="lbl">Engravers</label><input name="eng" value="${esc((ev.engravers || []).join(', '))}"></div>
-              <div class="field"><label class="lbl">Where guests pick up</label><input name="pick" value="${esc(ev.pickupNote || 'at the engraving table')}"></div>
-              <div class="field"><span class="lbl">Items offered</span><div class="checks">${itemChecks(ev)}</div></div>
-              <div class="field"><label class="lbl">Example photos — one per line: key = photo link</label>
-                <textarea name="photos" placeholder="bagtag_black_stars = https://drive.google.com/file/d/…/view&#10;bagtag_black = …&#10;tumbler = …">${esc(photosText(ev))}</textarea>
-                <span style="font-size:.8125rem;color:var(--muted)">Keys: item, item_color, or item_color_detail (bagtag, tumbler_white, bagtag_tan_heart). Drive links must be shared "anyone with the link".</span></div>
-              <label style="display:flex;gap:8px;align-items:center;min-height:44px"><input type="checkbox" name="open" ${ev.open === false ? '' : 'checked'}> Taking orders</label>
-              <button class="btn out" data-save type="button">Save changes</button>
-            </details></div></div>`;
-      }).join('') || '<p class="note" style="text-align:left">No events yet.</p>'}
-      </div>`;
-    document.getElementById('out').onclick = e => { e.preventDefault(); signOut(auth).then(() => { location.hash = '#/'; }); };
-    $app.querySelectorAll('.qr').forEach(el => { const q = qrcode(0, 'M'); q.addData(el.dataset.url); q.make(); el.innerHTML = q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }); });
-    $app.querySelectorAll('[data-copy]').forEach(a => a.onclick = e => { e.preventDefault(); navigator.clipboard?.writeText(a.dataset.copy).then(() => toast('Guest link copied')); });
-    $app.querySelectorAll('[data-qr]').forEach(a => a.onclick = e => {
-      e.preventDefault(); const q = qrcode(0, 'M'); q.addData(a.closest('.event').querySelector('.qr').dataset.url); q.make();
-      const l = document.createElement('a'); l.href = q.createDataURL(12, 4); l.download = `qr-${a.dataset.qr}.gif`; l.click();
-    });
-    $app.querySelectorAll('[data-export]').forEach(a => a.onclick = async e => {
-      e.preventDefault(); const ev = evs.find(x => x.id === a.dataset.export);
-      try { await exportOrders(ev.id, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); }
-    });
-    const mk = document.getElementById('mkdemo'); if (mk) mk.onclick = async () => { mk.disabled = true; if (await confirmResetDemo(false)) load(); else mk.disabled = false; };
-    $app.querySelectorAll('[data-resetdemo]').forEach(a => a.onclick = async e => { e.preventDefault(); if (await confirmResetDemo(true)) load(); });
-    document.getElementById('new').onsubmit = async e => {
-      e.preventDefault();
-      const name = document.getElementById('n-name').value.trim(), date = document.getElementById('n-date').value;
-      const items = {}; e.target.querySelectorAll('[name=item]').forEach(c => items[c.value] = c.checked);
-      const engravers = document.getElementById('n-eng').value.split(',').map(s => s.trim()).filter(Boolean);
-      try {
-        await setDoc(doc(db, 'events', slug(`${name}-${date}`)), { name, date, engravers, items, services: ['engraving'], catalog: DEFAULT_CATALOG, photos: {}, pickupNote: document.getElementById('n-pick').value.trim(), open: true, createdAt: serverTimestamp() });
-        toast('Event created'); load();
-      } catch (err) { toast('Could not create: ' + (err.code || err.message)); }
-    };
-    $app.querySelectorAll('[data-save]').forEach(btn => btn.onclick = async () => {
-      const box = btn.closest('.event'); const id = box.dataset.id;
-      const items = {}; box.querySelectorAll('[name=item]').forEach(c => items[c.value] = c.checked);
-      const photos = {};
-      box.querySelector('[name=photos]').value.split('\n').forEach(line => { const i = line.indexOf('='); if (i < 1) return; const k = line.slice(0, i).trim().replace(/\s+/g, ''); const v = line.slice(i + 1).trim(); if (k && v) photos[k] = driveToDirect(v); });
-      const engravers = box.querySelector('[name=eng]').value.split(',').map(s => s.trim()).filter(Boolean);
-      try { await updateDoc(doc(db, 'events', id), { items, photos, engravers, pickupNote: box.querySelector('[name=pick]').value.trim(), open: box.querySelector('[name=open]').checked }); toast('Saved'); load(); }
-      catch (err) { toast('Could not save: ' + (err.code || err.message)); }
-    });
-  }
-  $app.innerHTML = `<div class="page"><p class="note" style="padding:40px">Loading events…</p></div>`;
-  load().catch(e => { $app.innerHTML = `<div class="wrap"><p class="err">Could not load events: ${esc(e.code || e.message)}</p></div>`; });
+  $app.innerHTML = staffLoading('Loading events…');
+  let evs;
+  try { evs = (await getDocs(collection(db, 'events'))).docs.map(d => ({ id: d.id, ...d.data() })); }
+  catch (e) { $app.innerHTML = `<div class="wrap"><p class="err">Could not load events: ${esc(e.code || e.message)}</p></div>`; return; }
+  const today = todayStr();
+  const real = evs.filter(e => e.id !== DEMO_ID);
+  const upcoming = real.filter(e => (e.date || '') >= today).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const past = real.filter(e => (e.date || '') < today).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  const demo = evs.find(e => e.id === DEMO_ID);
+  const card = ev => `<a class="evcard" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} engravers</span></div>
+    <span class="chip ${ev.open === false ? '' : 'on'}">${ev.open === false ? 'Closed' : 'Taking orders'}</span><span class="chev" aria-hidden="true">›</span></a>`;
+  $app.innerHTML = `${staffHead('staff')}<main class="wrap">
+    <h1>your <em>events</em></h1>
+    <form id="new" class="card newev"><h2>new event</h2>
+      <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
+      <div class="field"><label class="lbl" for="n-date">Date</label><input id="n-date" type="date" required value="${today}"></div>
+      <button class="btn">Create and set up</button></form>
+    <h2 class="sec">upcoming</h2><div class="evlist">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled. Create one above.</p>'}</div>
+    ${past.length ? `<details class="pastev"><summary>Past events (${past.length})</summary><div class="evlist">${past.map(card).join('')}</div></details>` : ''}
+    <h2 class="sec">practice</h2>
+    ${demo ? `<div class="evlist">${card(demo)}</div><button class="linkbtn" id="rsdemo" type="button">Reset demo orders</button>`
+      : `<p class="note" style="text-align:left">A demo event comes with sample orders in every stage, to try the board.</p><button class="btn out" id="mkdemo" type="button" style="margin-top:10px;width:100%">Create demo event</button>`}
+  </main>`;
+  bindStaffHead();
+  const mk = document.getElementById('mkdemo'); if (mk) mk.onclick = async () => { mk.disabled = true; if (await confirmResetDemo(false)) adminPage(); else mk.disabled = false; };
+  const rs = document.getElementById('rsdemo'); if (rs) rs.onclick = () => confirmResetDemo(true);
+  document.getElementById('new').onsubmit = async e => {
+    e.preventDefault();
+    const name = document.getElementById('n-name').value.trim(), date = document.getElementById('n-date').value;
+    if (!name || !date) return;
+    const btn = e.target.querySelector('.btn'); btn.disabled = true;
+    try {
+      // Never overwrite an existing event that happens to share the name and date.
+      const base = slug(`${name}-${date}`) || 'event'; let id = base;
+      for (let n = 2; (await getDoc(doc(db, 'events', id))).exists(); n++) id = `${base}-${n}`;
+      const items = Object.fromEntries(allItems().map(([k]) => [k, true]));
+      await setDoc(doc(db, 'events', id), { name, date, engravers: ['Steph', 'Veronica', 'Christina', 'DeVaughn'], items, services: ['engraving'], catalog: DEFAULT_CATALOG, photos: {}, pickupNote: 'at the engraving table', open: true, createdAt: serverTimestamp() });
+      location.hash = `#/admin/${encodeURIComponent(id)}`;
+    } catch (err) { btn.disabled = false; toast('Could not create: ' + (err.code || err.message)); }
+  };
 }
+
+async function setupPage(eventId) {
+  $app.innerHTML = staffLoading('Loading event…');
+  let ev;
+  try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) { ev = null; }
+  if (!ev) { $app.innerHTML = `${staffHead('event setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
+  const st = { name: ev.name || '', date: ev.date || '', pickup: ev.pickupNote || 'at the engraving table', open: ev.open !== false,
+    engravers: [...(ev.engravers || [])], items: Object.fromEntries(allItems().map(([k]) => [k, ev.items?.[k] !== false])) };
+  const savedEngravers = [...st.engravers];
+  let dirty = false, saving = false;
+  const url = guestUrl(eventId);
+  const legacy = Object.keys(ev.photos || {}).length;
+  const markDirty = () => { dirty = true; const d = document.getElementById('dirty'); if (d) d.textContent = 'Unsaved changes'; const b = document.getElementById('save'); if (b) b.disabled = false; };
+  const chipsHTML = () => st.engravers.map((e, i) => `<span>${esc(e)}<button type="button" data-rm="${i}" aria-label="Remove ${esc(e)}">×</button></span>`).join('') || '<em class="note">No engravers yet.</em>';
+
+  $app.innerHTML = `${staffHead('event setup')}<main class="wrap setup">
+    <h1>${esc(st.name)}</h1>
+    <div class="btnrow"><a class="btn" href="#/board/${encodeURIComponent(eventId)}">Open board</a><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Preview guest form</a></div>
+    <section class="card"><h2>details</h2>
+      <div class="field"><label class="lbl" for="s-name">Event name</label><input id="s-name" value="${esc(st.name)}"></div>
+      <div class="field"><label class="lbl" for="s-date">Date</label><input id="s-date" type="date" value="${esc(st.date)}"></div>
+      <div class="field"><label class="lbl" for="s-pick">Where guests pick up (finishes "pick it up …")</label><input id="s-pick" value="${esc(st.pickup)}"></div>
+      <label class="tog"><input type="checkbox" id="s-open" ${st.open ? 'checked' : ''}> Taking orders <small>Turn off to close the guest form. Pieces already ordered still show on the board.</small></label></section>
+    <section class="card"><h2>engravers</h2><p class="hint">Each engraver gets a lane on the board.</p>
+      <div class="chips" id="chips">${chipsHTML()}</div>
+      <div class="addrow"><label class="vh" for="s-eng">Add an engraver</label><input id="s-eng" placeholder="Name" autocapitalize="words"><button class="btn out" id="addeng" type="button">Add</button></div></section>
+    <section class="card"><h2>pieces offered</h2><p class="hint">Guests only see the pieces checked here. Example photos come from the <a href="#/photos">photo library</a>.</p>
+      <div class="items">${allItems().map(([k, v]) => `<label class="itile"><span class="ph">${previewHTML(ev, { item: k, color: Object.keys(v.colors)[0], addon: 'none' }, false)}</span>
+        <span><input type="checkbox" data-item="${k}" ${st.items[k] ? 'checked' : ''}> ${esc(v.label)}</span></label>`).join('')}</div></section>
+    <section class="card"><h2>guest link &amp; QR</h2>
+      <div class="share"><div class="qr" aria-label="QR code for the guest form">${qrSvg(url)}</div>
+        <div class="shareinfo"><div class="url">${esc(url)}</div><div class="btnrow"><button class="btn out" id="copy" type="button">Copy link</button><button class="btn out" id="dlqr" type="button">Download QR to print</button></div></div></div></section>
+    <section class="card"><h2>after the event</h2><p class="hint">Orders with times for each step, as a file Google Sheets opens.</p>
+      <button class="btn out" id="export" type="button">Export orders</button>
+      ${legacy ? `<p class="hint" style="margin-top:14px">This event still has ${legacy} photo link${legacy === 1 ? '' : 's'} from the old setup, which override the photo library.</p><button class="linkbtn" id="clearlegacy" type="button">Remove old photo links</button>` : ''}</section>
+  </main>
+  <div class="savebar"><span id="dirty">All changes saved</span><button class="btn" id="save" type="button" disabled>Save</button></div>`;
+  bindStaffHead();
+  photoRerender = () => document.querySelectorAll('.itile').forEach((t, i) => { const [k, v] = allItems()[i]; t.querySelector('.ph').innerHTML = previewHTML(ev, { item: k, color: Object.keys(v.colors)[0], addon: 'none' }, false); });
+
+  const bindChips = () => document.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { st.engravers.splice(+b.dataset.rm, 1); document.getElementById('chips').innerHTML = chipsHTML(); bindChips(); markDirty(); });
+  bindChips();
+  const engIn = document.getElementById('s-eng');
+  const addEng = () => {
+    const n = engIn.value.trim(); if (!n) return;
+    if (st.engravers.some(e => e.toLowerCase() === n.toLowerCase())) { toast(`${n} is already on the list`); return; }
+    st.engravers.push(n); engIn.value = ''; document.getElementById('chips').innerHTML = chipsHTML(); bindChips(); markDirty(); engIn.focus();
+  };
+  document.getElementById('addeng').onclick = addEng;
+  engIn.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addEng(); } };
+  [['s-name', 'name'], ['s-date', 'date'], ['s-pick', 'pickup']].forEach(([id, k]) => document.getElementById(id).oninput = e => { st[k] = e.target.value; markDirty(); });
+  document.getElementById('s-open').onchange = e => { st.open = e.target.checked; markDirty(); };
+  document.querySelectorAll('[data-item]').forEach(c => c.onchange = () => { st.items[c.dataset.item] = c.checked; markDirty(); });
+  document.getElementById('copy').onclick = () => (navigator.clipboard?.writeText(url) || Promise.reject()).then(() => toast('Guest link copied')).catch(() => toast(url));
+  document.getElementById('dlqr').onclick = () => downloadQr(url, eventId);
+  document.getElementById('export').onclick = async () => { try { await exportOrders(eventId, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); } };
+  const cl = document.getElementById('clearlegacy');
+  if (cl) cl.onclick = async () => { try { await updateDoc(doc(db, 'events', eventId), { photos: {} }); toast('Old photo links removed'); setupPage(eventId); } catch (err) { toast('Could not remove: ' + (err.code || err.message)); } };
+
+  document.getElementById('save').onclick = async () => {
+    if (saving || !dirty) return;
+    if (!st.name.trim() || !st.date) { toast('The event needs a name and a date.'); return; }
+    if (!st.engravers.length) { toast('Add at least one engraver.'); return; }
+    if (!Object.values(st.items).some(Boolean)) { toast('Offer at least one piece.'); return; }
+    saving = true; const b = document.getElementById('save'); b.disabled = true; b.textContent = 'Saving…';
+    try {
+      // Removing an engraver hides their lane, so don't allow it while they have a piece in progress.
+      const removed = savedEngravers.filter(e => !st.engravers.includes(e));
+      if (removed.length) {
+        const busy = (await getDocs(collection(db, 'events', eventId, 'orders'))).docs.map(d => d.data()).find(o => o.status === 'progress' && removed.includes(o.engraver));
+        if (busy) { toast(`${busy.engraver} has ${busy.name}'s piece in progress. Finish or move it before removing them.`); return; }
+      }
+      await updateDoc(doc(db, 'events', eventId), { name: st.name.trim(), date: st.date, pickupNote: st.pickup.trim() || 'at the engraving table', open: st.open, engravers: st.engravers, items: st.items, updatedAt: serverTimestamp() });
+      savedEngravers.splice(0, savedEngravers.length, ...st.engravers);
+      dirty = false; document.getElementById('dirty').textContent = 'All changes saved'; document.querySelector('.setup h1').textContent = st.name.trim(); toast('Saved');
+    } catch (err) { toast('Could not save: ' + (err.code || err.message)); }
+    finally { saving = false; b.textContent = 'Save'; b.disabled = !dirty; }
+  };
+  const leave = e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } };
+  addEventListener('beforeunload', leave); unsubs.push(() => removeEventListener('beforeunload', leave));
+}
+
+// Phone photos shrink to a small JPEG stored in Firestore (the free plan has no file storage).
+async function fileToJpeg(file, max = 720) {
+  const src = URL.createObjectURL(file);
+  try {
+    const img = new Image(); img.src = src; await img.decode();
+    const s = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement('canvas'); c.width = Math.round(img.naturalWidth * s); c.height = Math.round(img.naturalHeight * s);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    let out = c.toDataURL('image/jpeg', 0.72);
+    if (out.length > 600000) out = c.toDataURL('image/jpeg', 0.5);
+    return out;
+  } finally { URL.revokeObjectURL(src); }
+}
+
+async function photosPage() {
+  const slots = allItems().flatMap(([item, v]) => Object.entries(v.colors).flatMap(([color, cLabel]) =>
+    Object.entries(v.addons).map(([addon, aLabel]) => ({ item, color, addon, key: addon === 'none' ? `${item}_${color}` : `${item}_${color}_${addon}`, label: `${cLabel} · ${aLabel.toLowerCase()}` }))));
+  $app.innerHTML = staffLoading('Loading photos…');
+  await Promise.all(slots.map(s => getDoc(doc(db, 'photos', s.key)).then(d => { photoLib[s.key] = d.exists() ? (d.data().data || null) : null; }).catch(() => {})));
+  const busy = new Set();
+  const tile = s => {
+    const has = typeof photoLib[s.key] === 'string', up = busy.has(s.key);
+    return `<figure class="ptile" data-key="${s.key}"><div class="pimg ${has ? '' : 'none'}">${has ? `<img src="${esc(photoLib[s.key])}" alt="">` : window.EngravePreview.renderPreview({ item: s.item === 'tumbler' ? 'tumbler' : 'bagtag', color: s.color, addon: s.addon, name: '', font: 'script' })}${has ? '' : '<span class="tag">no photo yet</span>'}</div>
+      <figcaption>${esc(s.label)}</figcaption><div class="acts"><label class="up ${up ? 'busy' : ''}">${up ? 'Uploading…' : has ? 'Replace' : 'Add photo'}<input type="file" accept="image/*" data-up="${s.key}" ${up ? 'disabled' : ''}></label>
+      ${has && !up ? `<button class="rm" type="button" data-del="${s.key}" aria-label="Remove photo">×</button>` : ''}</div></figure>`;
+  };
+  function render() {
+    const n = slots.filter(s => typeof photoLib[s.key] === 'string').length;
+    $app.innerHTML = `${staffHead('photos')}<main class="wrap"><h1>example <em>photos</em></h1>
+      <p class="hint">${n} of ${slots.length} added. Guests see these when they pick a finish and detail; without one they see a drawn preview. Every event uses this library. Shoot in portrait with the piece centered.</p>
+      ${allItems().map(([item, v]) => `<h2 class="sec">${esc(v.label.toLowerCase())}</h2><div class="pgrid">${slots.filter(s => s.item === item).map(tile).join('')}</div>`).join('')}</main>`;
+    bindStaffHead();
+    document.querySelectorAll('[data-up]').forEach(inp => inp.onchange = async () => {
+      const f = inp.files && inp.files[0]; if (!f) return; const key = inp.dataset.up;
+      busy.add(key); render();
+      try {
+        const data = await fileToJpeg(f);
+        await setDoc(doc(db, 'photos', key), { data, updatedAt: serverTimestamp(), by: user.email });
+        photoLib[key] = data; toast('Photo saved');
+      } catch (err) { toast('Could not save that photo: ' + (err.code || err.message || 'unreadable image')); }
+      finally { busy.delete(key); render(); }
+    });
+    document.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+      const key = b.dataset.del, old = photoLib[key];
+      try {
+        await deleteDoc(doc(db, 'photos', key)); photoLib[key] = null; render();
+        toast('Photo removed', { label: 'Undo', run: () => setDoc(doc(db, 'photos', key), { data: old, updatedAt: serverTimestamp(), by: user.email }).then(() => { photoLib[key] = old; render(); }) });
+      } catch (err) { toast('Could not remove: ' + (err.code || err.message)); }
+    });
+  }
+  render();
+}
+
 
 route();
