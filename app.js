@@ -448,8 +448,10 @@ async function boardPage(eventId) {
     document.getElementById('pkx').onclick = () => { d.close(); document.getElementById('openpk').focus(); };
     document.getElementById('find').oninput = renderPickup;
     document.getElementById('find').onkeydown = e => { if (e.key === 'Enter') e.preventDefault(); };
+    // On a phone the cards fill the screen, so a touch has to scroll the page first; dragging needs a longer hold.
+    const phone = matchMedia('(max-width:820px)').matches;
     document.querySelectorAll('.drop').forEach(el => new Sortable(el, {
-      group: 'orders', animation: 150, delay: 120, delayOnTouchOnly: true, draggable: '.qc,.now', filter: 'button,.who', preventOnFilter: false,
+      group: 'orders', animation: 150, delay: phone ? 350 : 120, delayOnTouchOnly: true, touchStartThreshold: phone ? 8 : 1, ...(phone ? { supportPointer: false } : {}), draggable: '.qc,.now', filter: 'button,.who', preventOnFilter: false,
       onStart: () => { dragging = true; },
       onMove: evt => !(evt.to.classList.contains('zone') && evt.to.querySelector('.now') && evt.to !== evt.from), // one piece per engraver
       onEnd: evt => {
