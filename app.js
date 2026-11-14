@@ -39,6 +39,9 @@ const LOGO = `<img class="logo" src="logo.png" alt="Ivelisse Designs">`;
 const $app = document.getElementById('app');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const shortId = id => id.slice(-4).toUpperCase();
+// US mobile numbers only: returns +1XXXXXXXXXX, '' when empty, or null when it isn't a valid number.
+const normPhone = v => { const d = String(v || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, ''); if (!d) return ''; return /^[2-9]\d{2}[2-9]\d{6}$/.test(d) ? '+1' + d : null; };
+const fmtPhone = e => { const d = String(e || '').replace(/^\+1/, ''); return d.length === 10 ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}` : e; };
 const fmtDate = d => { if (!d) return ''; const t = new Date(d + 'T12:00:00'); return isNaN(t) ? d : t.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); };
 const fmtTime = d => d ? d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase() : '';
 const tsDate = t => (t && typeof t.toDate === 'function') ? t.toDate() : (typeof t === 'number' ? new Date(t) : null);
@@ -155,7 +158,7 @@ async function guestForm(eventId) {
   const cat = catalog(ev);
   const services = (ev.services || ['engraving']).filter(s => cat[s] && Object.keys(cat[s].items).some(k => ev.items?.[k] !== false));
   const itemsFor = svc => Object.entries(cat[svc]?.items || {}).filter(([k]) => ev.items?.[k] !== false);
-  const st = { step: 1, svc: services[0], item: null, color: null, addon: 'none', name: '', font: 'script', sending: false };
+  const st = { step: 1, svc: services[0], item: null, color: null, addon: 'none', name: '', font: 'script', phone: '', sending: false };
   const f = itemsFor(st.svc)[0]; if (f) { st.item = f[0]; st.color = Object.keys(f[1].colors)[0]; }
   const submitKey = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random())).replace(/-/g, '').slice(0, 20);
 
@@ -197,6 +200,9 @@ async function guestForm(eventId) {
           <dl class="rows"><div><dt>Name</dt><dd><b style="font-size:1.125rem">${esc(st.name.trim())}</b></dd></div><div><dt>Piece</dt><dd>${esc(it.label)}</dd></div>
           <div><dt>Details</dt><dd>${esc(it.colors[st.color])} • ${esc(it.addons[st.addon])} • ${esc(FONTS[st.font])}</dd></div>
           </dl><div class="spell"><span>Spelled right?</span><button class="editbtn" id="edit" type="button">✎ Edit</button></div></div>
+        <div class="optin"><label class="lbl" for="ph">Want a text when it's ready? <span>optional</span></label>
+          <input id="ph" class="phonefield" type="tel" inputmode="tel" autocomplete="tel" placeholder="(214) 555-0123" value="${esc(st.phone)}">
+          <p class="fine">By adding your number, you agree to get up to 3 texts from Ivelisse Designs about this order: your place in line, when it's ready, and one thank-you with a review link. Msg &amp; data rates may apply. Reply STOP to opt out, HELP for help.</p></div>
         <p class="err" id="err" role="alert"></p>`;
       bar = `<button class="btn sec" id="back" type="button">Back</button><button class="btn" id="send" type="button" ${st.sending ? 'disabled' : ''}>${st.sending ? 'Sending…' : 'Send for engraving'}</button>`;
     }
@@ -222,9 +228,12 @@ async function guestForm(eventId) {
     go('back', () => { st.step--; render(); window.scrollTo(0, 0); });
     go('edit', () => { st.step = 2; render(); setTimeout(() => document.getElementById('nm')?.focus(), 50); });
     go('send', submit);
+    const ph = document.getElementById('ph'); if (ph) ph.oninput = () => { st.phone = ph.value; document.getElementById('err').textContent = ''; };
   }
   async function submit() {
     const name = st.name.trim().slice(0, 14);
+    const phone = normPhone(st.phone);
+    if (phone === null) { document.getElementById('err').textContent = "That number doesn't look right. Use a 10-digit US mobile number, or leave it blank."; document.getElementById('ph')?.focus(); return; }
     // Re-check the event is still taking orders and the piece is still offered.
     try {
       const s = await getDoc(doc(db, 'events', eventId)); const fresh = s.exists() ? s.data() : null;
@@ -234,7 +243,7 @@ async function guestForm(eventId) {
     st.sending = true; render();
     // The order id is fixed for this form visit, so a retry overwrites the same order instead of creating a second one.
     const ref = doc(db, 'events', eventId, 'orders', submitKey);
-    const data = { uid: user.uid, service: st.svc, item: st.item, color: st.color, addon: st.addon, font: st.font, name, status: 'queue', engraver: null, createdAt: serverTimestamp(), clientAt: Date.now() };
+    const data = { uid: user.uid, service: st.svc, item: st.item, color: st.color, addon: st.addon, font: st.font, name, status: 'queue', engraver: null, createdAt: serverTimestamp(), clientAt: Date.now(), ...(phone ? { phone, textOptIn: true, optInAt: Date.now() } : {}) };
     // One batch: create the order and add it to the bottom of the public line, so the guest's
     // "pieces ahead" count works even when no board is open.
     const batch = writeBatch(db);
@@ -285,7 +294,7 @@ async function statusPage(eventId, orderId) {
       html = `<header class="band">${LOGO}<div class="ev">order ${shortId(orderId)}</div>${WAVE(390)}</header>
         <main class="content"><div class="state">${state}</div>
         <p class="vh" role="status" aria-atomic="true" id="announce"></p>
-        ${miles}${item}${save}${live}</main>`;
+        ${miles}${item}${order.phone ? `<p class="note" style="font-size:.875rem">We'll text ${esc(fmtPhone(order.phone))} when it's ready.</p>` : ''}${save}${live}</main>`;
     }
     $app.innerHTML = `<div class="page">${html}</div>`;
     const ann = document.getElementById('announce');
@@ -409,7 +418,7 @@ async function boardPage(eventId) {
     const action = free.length === 0 ? `<button class="go" type="button" disabled>All engravers busy</button>`
       : free.length === 1 ? `<button class="go" type="button" data-start="${o.id}" data-who="${esc(free[0])}">Start with ${esc(free[0])}</button>`
       : `<button class="go" type="button" data-pick="${o.id}" aria-expanded="${openWho === o.id}">Start ▾</button>`;
-    return `<div class="qc" data-id="${o.id}"><span class="ph">${previewHTML(ev, o)}</span><div class="nm"><span class="pos" aria-label="Position ${i + 1}">${i + 1}</span>${esc(o.name)}</div><div class="ds">#${shortId(o.id)} • ${esc(describe(ev, o, true))} • ${esc((FONTS[o.font] || '').toLowerCase())}</div>
+    return `<div class="qc" data-id="${o.id}"><span class="ph">${previewHTML(ev, o)}</span><div class="nm"><span class="pos" aria-label="Position ${i + 1}">${i + 1}</span>${esc(o.name)}</div><div class="ds">#${shortId(o.id)} • ${esc(describe(ev, o, true))} • ${esc((FONTS[o.font] || '').toLowerCase())}${o.phone ? ' • <b class="txt">gets texts</b>' : ''}</div>
       <div class="ft"><span class="age ${m >= 10 ? 'hot' : ''}">waiting ${m} min</span>${action}</div>
       ${openWho === o.id ? `<div class="who">${free.map(e => `<button type="button" data-start="${o.id}" data-who="${esc(e)}">${esc(e)}</button>`).join('')}</div>` : ''}${pendChip(o)}</div>`;
   }
