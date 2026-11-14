@@ -2,7 +2,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/fireba
 import { getAuth, signInAnonymously, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   initializeFirestore, persistentLocalCache, persistentSingleTabManager, memoryLocalCache,
-  doc, collection, setDoc, updateDoc, getDoc, getDocs, onSnapshot, query, orderBy, serverTimestamp, writeBatch, arrayUnion, getDocFromServer
+  doc, collection, setDoc, updateDoc, getDoc, getDocs, onSnapshot, query, orderBy, serverTimestamp, writeBatch, arrayUnion, getDocFromServer, Timestamp
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { firebaseConfig } from './firebase-config.js';
 
@@ -308,6 +308,53 @@ async function statusPage(eventId, orderId) {
   render();
 }
 
+// ---------- demo event ----------
+// A practice event with sample orders in every stage. Reset wipes its orders (including any test
+// orders placed through the guest form) and puts the samples back. Real events are never touched.
+const DEMO_ID = 'demo';
+const DEMO_ENGRAVERS = ['Steph', 'Veronica', 'Christina', 'DeVaughn'];
+const DEMO_ORDERS = [
+  // [id, name, item, color, addon, font, status, engraver, minutes ago submitted, started, ready, picked up]
+  ['demo-r3k8', 'Harper', 'bagtag', 'black', 'none', 'script', 'picked', 'Steph', 48, 44, 39, 35],
+  ['demo-w5n2', 'Ethan', 'tumbler', 'black', 'stars', 'serif', 'picked', 'Veronica', 45, 41, 34, 30],
+  ['demo-h7q4', 'Camila', 'bagtag', 'blush', 'heart', 'script', 'done', 'Christina', 38, 33, 27, null],
+  ['demo-t9b6', 'Noah', 'tumbler', 'white', 'none', 'serif', 'done', 'Steph', 34, 28, 21, null],
+  ['demo-m2x7', 'Ava', 'bagtag', 'tan', 'stars', 'script', 'done', 'Veronica', 30, 24, 16, null],
+  ['demo-c4j9', 'Priya', 'tumbler', 'terracotta', 'heart', 'script', 'progress', 'Steph', 22, 5, null, null],
+  ['demo-p6d3', 'Jordan', 'bagtag', 'black', 'stars', 'serif', 'progress', 'Veronica', 19, 3, null, null],
+  ['demo-k8f5', 'Maya', 'bagtag', 'tan', 'none', 'script', 'queue', null, 14, null, null, null],
+  ['demo-y3g7', 'Liam', 'tumbler', 'black', 'none', 'serif', 'queue', null, 11, null, null, null],
+  ['demo-b5v2', 'Sofia', 'bagtag', 'blush', 'heart', 'script', 'queue', null, 7, null, null, null],
+  ['demo-z7s4', 'Zoe', 'tumbler', 'white', 'stars', 'script', 'queue', null, 3, null, null, null]
+];
+async function resetDemo() {
+  const evRef = doc(db, 'events', DEMO_ID);
+  const old = await getDoc(evRef).catch(() => null);
+  const prev = old && old.exists() ? old.data() : null;
+  const today = new Date(); const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  await setDoc(evRef, { name: 'Demo event', date, engravers: DEMO_ENGRAVERS, items: { bagtag: true, tumbler: true }, services: ['engraving'], catalog: DEFAULT_CATALOG,
+    photos: prev?.photos || {}, pickupNote: prev?.pickupNote || 'at the engraving table', open: true, demo: true, createdAt: prev?.createdAt || serverTimestamp() });
+  // Clear every order in the demo event.
+  const snap = await getDocs(collection(db, 'events', DEMO_ID, 'orders'));
+  for (let i = 0; i < snap.docs.length; i += 400) { const b = writeBatch(db); snap.docs.slice(i, i + 400).forEach(d => b.delete(d.ref)); await b.commit(); }
+  // Orders have to start in the queue (same rule guests follow), then get moved to their stage.
+  const ago = m => m == null ? null : Timestamp.fromMillis(Date.now() - m * 60000);
+  const make = writeBatch(db), place = writeBatch(db);
+  DEMO_ORDERS.forEach(([id, name, item, color, addon, font, status, engraver, sub, started, ready, picked]) => {
+    const ref = doc(db, 'events', DEMO_ID, 'orders', id);
+    make.set(ref, { uid: user.uid, service: 'engraving', item, color, addon, font, name, status: 'queue', engraver: null, createdAt: ago(sub), clientAt: Date.now() - sub * 60000, demo: true });
+    if (status !== 'queue') place.update(ref, { status, engraver, startedAt: ago(started), doneAt: ago(ready), pickedAt: ago(picked), updatedAt: serverTimestamp() });
+  });
+  await make.commit();
+  place.set(doc(db, 'events', DEMO_ID, 'public', 'queue'), { ids: DEMO_ORDERS.filter(o => o[6] === 'queue').map(o => o[0]), updatedAt: serverTimestamp() });
+  await place.commit();
+}
+async function confirmResetDemo(exists) {
+  if (exists && !confirm('Reset the demo event? This clears every order in it and puts the sample orders back. Real events are not touched.')) return false;
+  try { await resetDemo(); toast(exists ? 'Demo reset' : 'Demo event ready'); return true; }
+  catch (e) { toast('Demo reset failed: ' + (e.code || e.message)); return false; }
+}
+
 // ---------- board ----------
 async function boardPage(eventId) {
   let ev = null, orders = [], fromCache = false, lastQueueSig = '', dragging = false, openWho = null, pickupQuery = '';
@@ -358,7 +405,7 @@ async function boardPage(eventId) {
         <div class="k"><span><b>${n.q}</b>waiting</span><span><b>${n.p}</b>engraving</span><span><b>${n.x}</b>picked up</span>
           <button class="pu" id="openpk" type="button">${n.r} to pick up ›</button>
           <span class="lv ${online() ? '' : 'off'}"><i aria-hidden="true"></i>${online() ? 'Live' : 'Offline • moves save on this iPad'}</span>
-          <a href="#/admin">events</a></div>${WAVE(1180)}</header>
+          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}<a href="#/admin">events</a></div>${WAVE(1180)}</header>
       <main class="lanes" style="--n:${engravers().length}">
         <section class="lane" aria-label="Queue"><h2>queue <small>first in line at the top</small></h2>
           <div class="drop" data-status="queue" data-engraver="">${q.map((o, i) => queueCard(o, free, i)).join('') || '<p class="note">No one waiting.</p>'}</div></section>
@@ -392,6 +439,7 @@ async function boardPage(eventId) {
     document.querySelectorAll('[data-pick]').forEach(b => b.onclick = () => { openWho = openWho === b.dataset.pick ? null : b.dataset.pick; render(); });
     document.querySelectorAll('[data-start]').forEach(b => b.onclick = () => { openWho = null; move(b.dataset.start, 'progress', b.dataset.who); });
     document.querySelectorAll('[data-ready]').forEach(b => b.onclick = () => move(b.dataset.ready, 'done'));
+    const rs = document.getElementById('resetdemo'); if (rs) rs.onclick = e => { e.preventDefault(); confirmResetDemo(true); };
     const d = document.getElementById('pk');
     document.getElementById('openpk').onclick = () => { d.showModal(); renderPickup(); document.getElementById('find').focus(); };
     document.getElementById('pkx').onclick = () => { d.close(); document.getElementById('openpk').focus(); };
@@ -456,6 +504,7 @@ async function adminPage() {
   function render() {
     $app.innerHTML = `<header class="band">${LOGO}<div class="ev">${esc(user.email)} · <a href="#" id="out" style="color:#fff">sign out</a></div>${WAVE(1180)}</header>
       <div class="wrap"><h1 style="text-align:left">your <em>events</em></h1>
+      ${evs.some(e => e.id === DEMO_ID) ? '' : `<p class="note" style="text-align:left;margin:12px 0 4px">Want to try it out first? A demo event comes with sample orders in every stage.</p><button class="btn out" id="mkdemo" type="button">Create demo event</button>`}
       <details ${evs.length ? '' : 'open'} style="margin-top:12px"><summary class="lbl" style="cursor:pointer;min-height:44px;display:flex;align-items:center;color:var(--ink)">+ New event</summary>
         <form id="new">
           <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
@@ -469,7 +518,7 @@ async function adminPage() {
         const url = `${baseUrl()}#/e/${encodeURIComponent(ev.id)}`;
         return `<div class="event" data-id="${esc(ev.id)}"><div class="qr" data-url="${esc(url)}"></div>
           <div class="info"><h2>${esc(ev.name)}</h2><div style="color:var(--muted)">${esc(fmtDate(ev.date))} · ${(ev.engravers || []).map(esc).join(', ')}${ev.open === false ? ' · <b>closed</b>' : ''}</div>
-            <div class="links"><a href="#/board/${encodeURIComponent(ev.id)}">Open board</a><a href="#/e/${encodeURIComponent(ev.id)}">Guest form</a><a href="#" data-copy="${esc(url)}">Copy guest link</a><a href="#" data-qr="${esc(ev.id)}">Download QR</a><a href="#" data-export="${esc(ev.id)}">Export orders (Sheets)</a></div>
+            <div class="links"><a href="#/board/${encodeURIComponent(ev.id)}">Open board</a><a href="#/e/${encodeURIComponent(ev.id)}">Guest form</a><a href="#" data-copy="${esc(url)}">Copy guest link</a><a href="#" data-qr="${esc(ev.id)}">Download QR</a><a href="#" data-export="${esc(ev.id)}">Export orders (Sheets)</a>${ev.id === DEMO_ID ? '<a href="#" data-resetdemo><b>Reset demo</b></a>' : ''}</div>
             <details><summary class="lbl" style="cursor:pointer;min-height:44px;display:flex;align-items:center;color:var(--ink)">Edit</summary>
               <div class="field"><label class="lbl">Engravers</label><input name="eng" value="${esc((ev.engravers || []).join(', '))}"></div>
               <div class="field"><label class="lbl">Where guests pick up</label><input name="pick" value="${esc(ev.pickupNote || 'at the engraving table')}"></div>
@@ -493,6 +542,8 @@ async function adminPage() {
       e.preventDefault(); const ev = evs.find(x => x.id === a.dataset.export);
       try { await exportOrders(ev.id, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); }
     });
+    const mk = document.getElementById('mkdemo'); if (mk) mk.onclick = async () => { mk.disabled = true; if (await confirmResetDemo(false)) load(); else mk.disabled = false; };
+    $app.querySelectorAll('[data-resetdemo]').forEach(a => a.onclick = async e => { e.preventDefault(); if (await confirmResetDemo(true)) load(); });
     document.getElementById('new').onsubmit = async e => {
       e.preventDefault();
       const name = document.getElementById('n-name').value.trim(), date = document.getElementById('n-date').value;
