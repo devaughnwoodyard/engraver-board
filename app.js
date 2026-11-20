@@ -400,6 +400,9 @@ async function statusPage(eventId, orderId) {
 // Shows guests what the order texts look like, laid out like the iPhone Messages app.
 // Nothing is sent; it's a simulation built from this order.
 const TEXT_FROM = '+1 (469) 398-8476';
+// Steph's Google Business Profile link.
+const REVIEW_URL = 'https://share.google/pYr87ENQgaxoU85Ng';
+const IG_URL = 'https://instagram.com/ivelissedesigns';
 let textCssDone = false;
 function textCss() {
   if (textCssDone) return; textCssDone = true;
@@ -469,15 +472,21 @@ function showTextSim(ev, order, pos, link) {
   const t0 = tsDate(order.createdAt) || tsDate(order.clientAt) || new Date();
   const at = m => new Date(t0.getTime() + m * 60000);
   const clock = d => d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const day = d => { const n = new Date(); n.setHours(0, 0, 0, 0); const x = new Date(d); x.setHours(0, 0, 0, 0); const diff = Math.round((x - n) / 864e5); return diff === 0 ? 'Today' : diff === 1 ? 'Tomorrow' : x.toLocaleDateString('en-US', { weekday: 'long' }); };
+  const stamp = d => `${day(d)} ${clock(d)}`;
+  // The thank-you goes out a few hours later, but never overnight: late orders get it the next morning at 10.
+  const thanksAt = (() => { const d = at(180); if (d.getHours() >= 21 || d.getHours() < 9 || d.getDate() !== at(0).getDate()) { const m = new Date(at(0)); if (at(0).getHours() >= 9) m.setDate(m.getDate() + 1); m.setHours(10, 0, 0, 0); return m; } return d; })();
   const now = new Date();
   const linkA = u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`;
   const card = (title, domain, hero) => `<div class="ims-card"><div class="hero">${hero}</div><div class="meta"><div class="t">${esc(title)}</div><div class="d">${esc(domain)}</div></div></div>`;
   // Each step: a centered timestamp (optional) and the bubbles that arrive together.
   const steps = [
-    { meta: `<b>Text Message</b><br>Today ${clock(at(0))}`, items: [
-      `Ivelisse Designs: Thanks, ${esc(name)}! Your ${esc(piece)} order is in and you're #${line} in line. Track it here: ${linkA(link)} Reply STOP to opt out, HELP for help.`,
-      { card: card('Your order • Ivelisse Designs', link.replace(/^https?:\/\//, '').split('/')[0], 'Ivelisse') }] },
-    { meta: `Today ${clock(at(18))}`, items: [`Ivelisse Designs: ${esc(name)}, your ${esc(piece)} is ready! Pick it up ${esc(pick)}. Reply STOP to opt out.`] }
+    { meta: `<b>Text Message</b><br>${stamp(at(0))}`, items: [
+      `Ivelisse Designs: Thanks, ${esc(name)}! Your ${esc(piece)} order is in and you're #${line} in line. Reply STOP to opt out, HELP for help.`] },
+    { meta: `${stamp(at(18))}`, items: [`Ivelisse Designs: ${esc(name)}, your ${esc(piece)} is ready! Pick it up ${esc(pick)}. Reply STOP to opt out.`] },
+    { meta: `${stamp(thanksAt)}`, items: [
+      `Ivelisse Designs: Thanks for celebrating with us, ${esc(name)}! Loved your ${esc(piece)}? Leave us a quick Google review: ${linkA(REVIEW_URL)} and follow us on Instagram: ${linkA(IG_URL)} Reply STOP to opt out.`,
+      { card: card('Ivelisse Designs', 'share.google', 'Ivelisse Designs') }] }
   ];
 
   const wrap = document.createElement('div');
