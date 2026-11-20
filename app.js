@@ -36,7 +36,7 @@ function loadCatalog(force = false) {
     .then(s => { const c = s.exists() && s.data().categories; if (Array.isArray(c)) CAT = { categories: c }; }).catch(() => {});
   return catLoading;
 }
-const FONTS = { script: 'Script', serif: 'Serif' };
+const FONTS = { script: 'Script', serif: 'Print' };
 const SWATCH = { black: '#1d1b1a', tan: '#a86b43', blush: '#d9aa98', white: '#efece6', terracotta: '#b9623f' };
 const STATUS_LABEL = { queue: 'Waiting', progress: 'Engraving', done: 'Ready for pickup', picked: 'Picked up' };
 const WAVE = w => `<svg class="wave" viewBox="0 0 ${w} 24" preserveAspectRatio="none" aria-hidden="true"><path d="M0 15 C ${w * .23} 0 ${w * .44} 28 ${w * .64} 11 S ${w * .92} 5 ${w} 15 L${w} 24 L0 24Z" fill="#fff8f0"/></svg>`;
@@ -349,7 +349,8 @@ async function statusPage(eventId, orderId) {
         <p class="vh" role="status" aria-atomic="true" id="announce"></p>
         ${miles}${item}${order.phone ? `<p class="note" style="font-size:.875rem">We'll text ${esc(fmtPhone(order.phone))} when it's ready.</p>` : ''}${save}${live}</main>`;
     }
-    $app.innerHTML = `<div class="page">${html}</div>`;
+    $app.innerHTML = `<div class="page">${html}</div>${textButtonHTML()}`;
+    const tb = document.getElementById('txtsim'); if (tb) tb.onclick = () => showTextSim(ev, order, pos, link);
     const ann = document.getElementById('announce');
     if (ann && sig !== lastSig) ann.textContent = s === 'progress' ? `${order.engraver || 'Your engraver'} is working on your piece.` : (pos >= 0 ? (pos === 0 ? "You're next." : aheadText(pos) + '.') : "You're in line.");
     if (sig !== lastSig && lastSig && s === 'done') { try { navigator.vibrate && navigator.vibrate([200, 100, 200]); } catch (e) {} document.title = '✓ Ready — Ivelisse'; }
@@ -393,6 +394,146 @@ async function statusPage(eventId, orderId) {
   timers.push(setInterval(() => { tick++; refresh(tick % 2 === 0); }, 5000));
   photoRerender = render;
   render();
+}
+
+// ---------- text preview ----------
+// Shows guests what the order texts look like, laid out like the iPhone Messages app.
+// Nothing is sent; it's a simulation built from this order.
+const TEXT_FROM = '+1 (469) 398-8476';
+let textCssDone = false;
+function textCss() {
+  if (textCssDone) return; textCssDone = true;
+  const s = document.createElement('style');
+  s.textContent = `
+.txtbtn{position:fixed;top:max(10px,env(safe-area-inset-top));right:10px;z-index:40;display:flex;align-items:center;gap:6px;min-height:40px;padding:0 14px;border:0;border-radius:20px;background:rgba(255,255,255,.94);color:#2b2522;font:700 .875rem var(--body);box-shadow:0 2px 10px rgba(0,0,0,.18);cursor:pointer}
+.txtbtn svg{width:18px;height:18px}
+.ims-wrap{position:fixed;inset:0;z-index:100;background:rgba(20,14,10,.55);display:flex;align-items:center;justify-content:center;animation:imsFade .2s ease}
+@keyframes imsFade{from{opacity:0}to{opacity:1}}
+.ims{width:100%;height:100%;background:#fff;display:flex;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',Helvetica,Arial,sans-serif;color:#000;-webkit-font-smoothing:antialiased;overflow:hidden;position:relative}
+@media (min-width:520px) and (min-height:760px){.ims{width:390px;height:844px;max-height:94vh;border-radius:54px;border:11px solid #111;box-shadow:0 30px 80px rgba(0,0,0,.45)}.ims .ims-island{display:block}}
+.ims-status{height:47px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 30px 0 34px;font-weight:600;font-size:16px;letter-spacing:-.2px;position:relative}
+.ims-island{display:none;position:absolute;top:10px;left:50%;transform:translateX(-50%);width:122px;height:35px;border-radius:20px;background:#000}
+.ims-icons{display:flex;gap:6px;align-items:center}
+.ims-icons svg{height:12px;width:auto;display:block}
+.ims-head{flex:none;display:grid;grid-template-columns:70px 1fr 70px;align-items:start;padding:2px 8px 8px;background:rgba(249,249,249,.94);border-bottom:.5px solid rgba(0,0,0,.18)}
+.ims-back{border:0;background:none;color:#007aff;font-size:17px;display:flex;align-items:center;gap:2px;padding:10px 0 0;cursor:pointer;font-family:inherit}
+.ims-back svg{width:12px;height:20px}
+.ims-who{display:flex;flex-direction:column;align-items:center;gap:4px}
+.ims-av{width:48px;height:48px;border-radius:50%;background:linear-gradient(#a5abb8,#858a96);display:flex;align-items:flex-end;justify-content:center;overflow:hidden}
+.ims-av svg{width:40px;height:40px}
+.ims-name{font-size:11px;color:#000;display:flex;align-items:center;gap:2px}
+.ims-name svg{width:6px;height:10px;opacity:.4}
+.ims-body{flex:1;overflow-y:auto;padding:10px 16px 14px;display:flex;flex-direction:column;-webkit-overflow-scrolling:touch}
+.ims-meta{text-align:center;font-size:11px;color:#8a8a8e;margin:14px 0 8px;line-height:1.35}
+.ims-meta b{font-weight:600}
+.ims-row{display:flex;margin-top:2px;animation:imsPop .28s cubic-bezier(.2,.9,.3,1.2)}
+@keyframes imsPop{from{opacity:0;transform:translateY(8px) scale(.96)}to{opacity:1;transform:none}}
+.ims-b{position:relative;max-width:75%;background:#e9e9eb;color:#000;border-radius:18px;padding:7px 12px 8px;font-size:17px;line-height:1.29;letter-spacing:-.2px;word-wrap:break-word;overflow-wrap:anywhere}
+.ims-b a{color:#000;text-decoration:underline}
+.ims-row.tail .ims-b:not(.ims-pic)::before{content:'';position:absolute;left:-7px;bottom:0;width:20px;height:18px;background:#e9e9eb;border-bottom-right-radius:16px 14px}
+.ims-row.tail .ims-b:not(.ims-pic)::after{content:'';position:absolute;left:-26px;bottom:0;width:26px;height:18px;background:#fff;border-bottom-right-radius:10px}
+.ims-pic{padding:0;overflow:hidden;width:220px;max-width:62%;background:#e9e9eb;border-radius:18px}
+.ims-pic img,.ims-pic svg{display:block;width:100%;height:auto}
+.ims-pic .ph-wrap{aspect-ratio:3/4;display:flex;align-items:center;justify-content:center;background:#f4ece5}
+.ims-pic .ph-wrap>*{width:100%;height:100%;object-fit:cover}
+.ims-card{max-width:75%;width:260px;border-radius:18px;overflow:hidden;background:#e9e9eb;margin-top:2px}
+.ims-card .hero{height:120px;background:linear-gradient(135deg,#b85c3a,#d9aa98);display:flex;align-items:center;justify-content:center;color:#fff8f0;font:400 30px var(--script,cursive)}
+.ims-card .meta{padding:8px 12px 10px;font-size:13px;line-height:1.3}
+.ims-card .t{font-weight:600;color:#000}
+.ims-card .d{color:#8a8a8e}
+.ims-typing{display:flex;gap:4px;align-items:center;padding:12px 14px}
+.ims-typing i{width:8px;height:8px;border-radius:50%;background:#8e8e93;animation:imsDot 1.2s infinite}
+.ims-typing i:nth-child(2){animation-delay:.15s}.ims-typing i:nth-child(3){animation-delay:.3s}
+@keyframes imsDot{0%,60%,100%{opacity:.35;transform:none}30%{opacity:1;transform:translateY(-2px)}}
+.ims-foot{flex:none;display:flex;align-items:center;gap:10px;padding:6px 12px 10px;background:#fff}
+.ims-plus{width:34px;height:34px;border-radius:50%;background:#eeeef0;display:flex;align-items:center;justify-content:center;flex:none}
+.ims-plus svg{width:16px;height:16px}
+.ims-field{flex:1;height:36px;border:1px solid #c7c7cc;border-radius:18px;display:flex;align-items:center;justify-content:space-between;padding:0 6px 0 14px;color:#b0b0b5;font-size:16px}
+.ims-field svg{width:18px;height:18px}
+.ims-home{flex:none;height:22px;display:flex;align-items:center;justify-content:center}
+.ims-home i{width:134px;height:5px;border-radius:3px;background:#000}
+.ims-note{flex:none;display:flex;align-items:center;justify-content:center;gap:8px;padding:6px 12px 2px;font-size:11px;color:#8a8a8e}
+.ims-replay{border:0;background:none;color:#007aff;font:600 12px -apple-system,system-ui,sans-serif;padding:4px 6px;cursor:pointer}
+@media (prefers-reduced-motion:reduce){.ims-row,.ims-wrap{animation:none}.ims-typing i{animation:none}}`;
+  document.head.appendChild(s);
+}
+const TXT_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12z"/></svg>`;
+function textButtonHTML() { textCss(); return `<button class="txtbtn" id="txtsim" type="button" aria-label="Preview the texts you'll get">${TXT_ICON}Texts</button>`; }
+
+function showTextSim(ev, order, pos, link) {
+  textCss();
+  const name = order.name || 'there';
+  const piece = pieceLabel(order).toLowerCase() || 'piece';
+  const line = pos >= 0 ? pos + 1 : 3;
+  const pick = ev?.pickupNote || 'at the engraving table';
+  const t0 = tsDate(order.createdAt) || tsDate(order.clientAt) || new Date();
+  const at = m => new Date(t0.getTime() + m * 60000);
+  const clock = d => d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const now = new Date();
+  const linkA = u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`;
+  const card = (title, domain, hero) => `<div class="ims-card"><div class="hero">${hero}</div><div class="meta"><div class="t">${esc(title)}</div><div class="d">${esc(domain)}</div></div></div>`;
+  // Each step: a centered timestamp (optional) and the bubbles that arrive together.
+  const steps = [
+    { meta: `<b>Text Message</b><br>Today ${clock(at(0))}`, items: [
+      `Ivelisse Designs: Thanks, ${esc(name)}! Your ${esc(piece)} order is in and you're #${line} in line. Track it here: ${linkA(link)} Reply STOP to opt out, HELP for help.`,
+      { card: card('Your order • Ivelisse Designs', link.replace(/^https?:\/\//, '').split('/')[0], 'Ivelisse') }] },
+    { meta: `Today ${clock(at(18))}`, items: [`Ivelisse Designs: ${esc(name)}, your ${esc(piece)} is ready! Pick it up ${esc(pick)}. Reply STOP to opt out.`] }
+  ];
+
+  const wrap = document.createElement('div');
+  wrap.className = 'ims-wrap';
+  wrap.setAttribute('role', 'dialog'); wrap.setAttribute('aria-modal', 'true'); wrap.setAttribute('aria-label', 'Preview of your order texts');
+  wrap.innerHTML = `<div class="ims">
+    <div class="ims-status"><span>${clock(now).replace(/\s?[AP]M$/i, '')}</span><span class="ims-island"></span>
+      <span class="ims-icons"><svg viewBox="0 0 18 12"><rect x="0" y="8" width="3" height="4" rx="1"/><rect x="5" y="5.5" width="3" height="6.5" rx="1"/><rect x="10" y="3" width="3" height="9" rx="1"/><rect x="15" y="0" width="3" height="12" rx="1"/></svg>
+      <svg viewBox="0 0 16 12"><path d="M8 2.6c2.2 0 4.2.9 5.7 2.3l1.1-1.1A9.6 9.6 0 0 0 8 1 9.6 9.6 0 0 0 1.2 3.8l1.1 1.1A8 8 0 0 1 8 2.6zm0 3.3c1.3 0 2.5.5 3.4 1.4l1.1-1.1A6.4 6.4 0 0 0 8 4.3a6.4 6.4 0 0 0-4.5 1.9l1.1 1.1A4.8 4.8 0 0 1 8 5.9zm0 3.3a1.6 1.6 0 0 0-1.1.5L8 11l1.1-1.3A1.6 1.6 0 0 0 8 9.2z"/></svg>
+      <svg viewBox="0 0 27 12"><rect x=".5" y=".5" width="22" height="11" rx="3.2" fill="none" stroke="currentColor" opacity=".4"/><rect x="2" y="2" width="16" height="8" rx="2"/><path d="M24 4v4c.8-.3 1.4-1.1 1.4-2s-.6-1.7-1.4-2z" opacity=".4"/></svg></span></div>
+    <div class="ims-head"><button class="ims-back" type="button" aria-label="Close preview"><svg viewBox="0 0 12 20"><path d="M10 2 2 10l8 8" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="ims-who"><div class="ims-av"><svg viewBox="0 0 40 40" fill="#fff"><circle cx="20" cy="15" r="8"/><path d="M4 40c0-9 7-15 16-15s16 6 16 15z"/></svg></div><div class="ims-name">${TEXT_FROM}<svg viewBox="0 0 6 10"><path d="M1 1l4 4-4 4" fill="none" stroke="#000" stroke-width="1.5"/></svg></div></div><span></span></div>
+    <div class="ims-body" aria-live="polite"></div>
+    <div class="ims-note"><span>Preview only. No texts were sent.</span><button class="ims-replay" type="button">Replay</button></div>
+    <div class="ims-foot"><span class="ims-plus"><svg viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" stroke="#8e8e93" stroke-width="2" stroke-linecap="round"/></svg></span>
+      <span class="ims-field">Text Message • SMS<svg viewBox="0 0 24 24" fill="none" stroke="#b0b0b5" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span></div>
+    <div class="ims-home"><i></i></div></div>`;
+  document.body.appendChild(wrap);
+  const body = wrap.querySelector('.ims-body');
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let timer = null, alive = true;
+  const wait = ms => new Promise(r => { timer = setTimeout(r, reduce ? 0 : ms); });
+  const scroll = () => body.scrollTo({ top: body.scrollHeight, behavior: reduce ? 'auto' : 'smooth' });
+  function bubble(it, tail) {
+    const row = document.createElement('div'); row.className = 'ims-row' + (tail ? ' tail' : '');
+    if (typeof it === 'string') row.innerHTML = `<div class="ims-b">${it}</div>`;
+    else if (it.pic) row.innerHTML = `<div class="ims-b ims-pic"><div class="ph-wrap">${it.pic}</div></div>`;
+    else row.innerHTML = it.card;
+    body.appendChild(row); scroll();
+  }
+  async function play() {
+    body.innerHTML = '';
+    for (const st of steps) {
+      if (!alive) return;
+      const m = document.createElement('div'); m.className = 'ims-meta'; m.innerHTML = st.meta; body.appendChild(m);
+      for (let i = 0; i < st.items.length; i++) {
+        const it = st.items[i];
+        if (typeof it === 'string' || it.pic) {
+          const ty = document.createElement('div'); ty.className = 'ims-row tail'; ty.innerHTML = `<div class="ims-b ims-typing"><i></i><i></i><i></i></div>`;
+          body.appendChild(ty); scroll(); await wait(1100); if (!alive) return; ty.remove();
+        } else await wait(250);
+        if (!alive) return;
+        const lastText = st.items.slice(i + 1).every(x => typeof x !== 'string' && !x.pic);
+        bubble(it, (typeof it === 'string' || it.pic) && lastText);
+      }
+      await wait(1300);
+    }
+  }
+  function close() { alive = false; clearTimeout(timer); removeEventListener('keydown', key); wrap.remove(); document.getElementById('txtsim')?.focus(); }
+  const key = e => { if (e.key === 'Escape') close(); };
+  addEventListener('keydown', key);
+  wrap.querySelector('.ims-back').onclick = close;
+  wrap.onclick = e => { if (e.target === wrap) close(); };
+  wrap.querySelector('.ims-replay').onclick = () => { alive = false; clearTimeout(timer); setTimeout(() => { alive = true; play(); }, 0); };
+  wrap.querySelector('.ims-back').focus();
+  play();
 }
 
 // ---------- demo event ----------
