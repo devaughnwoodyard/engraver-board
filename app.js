@@ -136,12 +136,11 @@ async function isStaff() {
 // Event setup, catalog and photos are for the managers (Google accounts listed in /staff).
 async function staffGate(render) {
   if (await isStaff()) return render();
-  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">event setup</div>${WAVE(390)}</header>
-    <main class="content"><a class="backlink" href="#/staff">‹ Event staff sign in</a><h1>event <em>setup</em></h1>
-    <p class="note">${user && !user.isAnonymous ? `Signed in as ${esc(user.email)}, which can't open event setup.` : 'Event setup is for Steph and DeVaughn. Sign in with Google.'}</p>
+  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">events</div>${WAVE(390)}</header>
+    <main class="content"><a class="backlink" href="#/staff">‹ Event staff sign in</a><h1>events</h1>
+    <p class="note">${user && !user.isAnonymous ? `Signed in as ${esc(user.email)}, which can't open Events.` : 'Sign in with Google.'}</p>
     <button class="btn" id="g" type="button">Sign in with Google</button>
     ${user && !user.isAnonymous ? '<button class="btn out" id="out" type="button">Sign out</button>' : ''}
-    <p class="note" style="font-size:.8125rem">Working an event? Use <a href="#/staff">Event staff sign in</a> instead.</p>
     <p class="note" style="font-size:.8125rem">On an iPad home-screen app, if the sign-in window doesn't open, open this page in Safari once and sign in there.</p></main></div>`;
   document.getElementById('g').onclick = async () => {
     try { await signInWithPopup(auth, new GoogleAuthProvider()); route(); }
@@ -150,14 +149,27 @@ async function staffGate(render) {
   const out = document.getElementById('out'); if (out) out.onclick = () => signOut(auth).then(route);
 }
 
-// Event staff: pick the event, pick your name from the list Steph set up, enter the event PIN once.
-// The PIN check happens in the database rules, which then let this device work that event's board.
+// Event staff: the app opens straight onto the event that's open now. Staff tap their name and enter the PIN once.
+// One PIN covers every event (managers set it in Event setup). The database rules check it, and only while the event is open.
 const staffKey = id => 'eb-staff-' + id;
 function staffName(id) { try { return localStorage.getItem(staffKey(id)) || ''; } catch (e) { return ''; } }
 function setStaffName(id, n) { try { localStorage.setItem(staffKey(id), n); } catch (e) {} }
 const newPin = () => String(crypto.getRandomValues(new Uint32Array(1))[0] % 10000).padStart(4, '0');
 const ymd = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const addDays = (s, n) => { const d = new Date(s + 'T12:00:00'); d.setDate(d.getDate() + n); return ymd(d); };
+const pinRef = () => doc(db, 'private', 'access');
+async function loadPin() { // managers only
+  const s = await getDoc(pinRef());
+  if (s.exists() && s.data().pin) return s.data().pin;
+  const p = newPin(); await setDoc(pinRef(), { pin: p, updatedAt: serverTimestamp() }); return p;
+}
+// Events running now: open and dated yesterday through next week, closest to today first. Two can run at once.
+function openEvents(evs) {
+  const today = todayStr(), from = addDays(today, -1), to = addDays(today, 7);
+  const dist = e => Math.abs(new Date(e.date + 'T12:00:00') - new Date(today + 'T12:00:00'));
+  return evs.filter(e => e.id !== DEMO_ID && e.open !== false && (e.date || '') >= from && (e.date || '') <= to)
+    .sort((a, b) => dist(a) - dist(b) || String(a.name).localeCompare(String(b.name)));
+}
 async function canWorkBoard(eventId) {
   if (eventId === DEMO_ID || await isStaff()) return true;
   if (!user) return false;
@@ -176,38 +188,39 @@ async function staffSignIn(eventId) {
   await authReady;
   const mgr = await isStaff();
   const head = `<header class="band">${LOGO}<div class="ev">event staff</div>${WAVE(390)}</header>`;
-  const setupLink = `<a class="btn out" href="#/admin" style="flex:none">Event setup</a><p class="note" style="font-size:.8125rem">Event setup is for Steph and DeVaughn.</p>`;
-  if (!eventId) {
-    let evs = [];
-    try { evs = await listEvents(); } catch (e) {}
-    // Active = yesterday (late-night events) through the next week.
-    const today = todayStr(), from = addDays(today, -1), to = addDays(today, 7);
-    const active = evs.filter(e => e.id !== DEMO_ID && (e.date || '') >= from && (e.date || '') <= to).sort((a, b) => String(a.date).localeCompare(String(b.date)));
-    const demo = evs.find(e => e.id === DEMO_ID);
-    const card = e => `<a class="evcard" href="#/staff/${encodeURIComponent(e.id)}"><div><b>${esc(e.name)}</b><span>${esc(fmtDate(e.date))} · ${(e.engravers || []).length} staff</span></div><span class="chev" aria-hidden="true">›</span></a>`;
-    $app.innerHTML = `<div class="page">${head}<main class="content"><h1>event staff <em>sign in</em></h1>
-      <p class="note">Pick your event.</p>
-      <div class="evlist">${active.map(card).join('') || '<p class="note">No events right now. Steph adds them in Event setup.</p>'}</div>
-      ${demo ? `<details class="pastev"><summary>Practice</summary><div class="evlist">${card(demo)}</div></details>` : ''}
-      ${setupLink}</main></div>`;
+  const foot = `<a class="barlink" href="#/admin">Events</a>`;
+  let ev = null, live = [];
+  if (eventId) { try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? { id: eventId, ...s.data() } : null; } catch (e) {} }
+  else { try { live = openEvents(await listEvents()); ev = live.find(e => staffName(e.id)) || live[0] || null; } catch (e) {} }
+  if (!ev) {
+    $app.innerHTML = `<div class="page">${head}<main class="content"><div class="rule"></div><h1>no event is <em>open</em></h1>
+      <p class="note">When an event opens, it shows up here.</p></main><div class="bar stack">${foot}</div></div>`;
     return;
   }
-  let ev = null;
-  try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
-  if (!ev) { $app.innerHTML = `<div class="page">${head}<main class="content"><h1>event not <em>found</em></h1><a class="btn out" href="#/staff">Pick another event</a></main></div>`; return; }
-  const names = ev.engravers || [];
+  eventId = ev.id;
+  if (ev.open === false && !mgr && eventId !== DEMO_ID) {
+    // Devices already signed in can still finish up on the board.
+    if (await canWorkBoard(eventId)) return boardPage(eventId);
+    $app.innerHTML = `<div class="page">${head}<main class="content"><div class="rule"></div><h1>this event is <em>closed</em></h1>
+      <p class="note">${esc(ev.name)} · ${esc(fmtDate(ev.date))}</p></main><div class="bar stack">${foot}</div></div>`;
+    return;
+  }
+  let names = ev.engravers || [];
   const needPin = eventId !== DEMO_ID && !mgr;
-  const st = { name: names.includes(staffName(eventId)) ? staffName(eventId) : (names.length === 1 ? names[0] : ''), pin: '', busy: false, err: '' };
+  const pickName = () => names.includes(staffName(eventId)) ? staffName(eventId) : (names.length === 1 ? names[0] : '');
+  const st = { name: pickName(), pin: '', busy: false, err: '' };
   function render() {
-    $app.innerHTML = `<div class="page">${head}<main class="content"><a class="backlink" href="#/staff">‹ All events</a>
-      <h1>${esc(ev.name)}</h1><p class="note">${esc(fmtDate(ev.date))}</p>
+    $app.innerHTML = `<div class="page">${head}<main class="content">
+      ${live.length > 1 ? `<fieldset><legend>which <em>event?</em></legend><div class="evpick" role="radiogroup" aria-label="Event">${live.map(e => `<button type="button" role="radio" aria-checked="${e.id === eventId}" data-ev="${esc(e.id)}"><b>${esc(e.name)}</b><small>${esc(fmtDate(e.date))}</small></button>`).join('')}</div></fieldset>`
+        : `<div class="evnow"><span class="eyebrow">event staff sign in</span><h1>${esc(ev.name)}</h1><p class="note">${esc(fmtDate(ev.date))}</p></div>`}
       <fieldset><legend>who are <em>you?</em></legend>
-        <div class="namegrid" role="radiogroup" aria-label="Your name">${names.map(n => `<button type="button" role="radio" aria-checked="${n === st.name}" data-nm="${esc(n)}">${esc(n)}</button>`).join('') || '<p class="note">No staff names on this event yet. Steph adds them in Event setup.</p>'}</div></fieldset>
-      ${needPin ? `<div class="field"><label class="lbl" for="pin" style="text-align:center">Event PIN</label>
-        <input id="pin" class="pinfield" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="one-time-code" value="${esc(st.pin)}"><p class="hint" style="text-align:center">Steph has it. You only enter it once on this device.</p></div>` : ''}
+        <div class="namegrid" role="radiogroup" aria-label="Your name">${names.map(n => `<button type="button" role="radio" aria-checked="${n === st.name}" data-nm="${esc(n)}">${esc(n)}</button>`).join('') || '<p class="note">No staff names on this event yet.</p>'}</div></fieldset>
+      ${needPin ? `<div class="field"><label class="lbl" for="pin" style="text-align:center">Staff PIN</label>
+        <input id="pin" class="pinfield" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="one-time-code" value="${esc(st.pin)}"></div>` : ''}
       <p class="err" role="alert">${esc(st.err)}</p></main>
-      <div class="bar"><button class="btn" id="go" type="button" ${!st.name || st.busy || (needPin && st.pin.length !== 4) ? 'disabled' : ''}>${st.busy ? 'Checking…' : 'Open the board'}</button></div></div>`;
+      <div class="bar stack"><button class="btn" id="go" type="button" ${!st.name || st.busy || (needPin && st.pin.length !== 4) ? 'disabled' : ''}>${st.busy ? 'Checking…' : 'Open the board'}</button>${foot}</div></div>`;
     $app.querySelectorAll('[data-nm]').forEach(b => b.onclick = () => { st.name = b.dataset.nm; st.err = ''; render(); document.getElementById('pin')?.focus(); });
+    $app.querySelectorAll('[data-ev]').forEach(b => b.onclick = () => { ev = live.find(e => e.id === b.dataset.ev); eventId = ev.id; names = ev.engravers || []; st.name = pickName(); st.err = ''; render(); });
     const p = document.getElementById('pin');
     if (p) p.oninput = () => { st.pin = p.value.replace(/\D/g, '').slice(0, 4); p.value = st.pin; st.err = ''; document.getElementById('go').disabled = !st.name || st.pin.length !== 4; };
     document.getElementById('go').onclick = go;
@@ -223,15 +236,30 @@ async function staffSignIn(eventId) {
       location.hash = `#/board/${encodeURIComponent(eventId)}`;
     } catch (e) {
       st.busy = false; st.pin = '';
-      st.err = e.code === 'permission-denied' ? "That PIN doesn't match. Check with Steph." : 'Could not sign in: ' + (e.code || e.message);
+      st.err = e.code === 'permission-denied' ? "That PIN doesn't match." : 'Could not sign in: ' + (e.code || e.message);
       render();
     }
   }
   render();
 }
 
+// The one guest QR: always opens whichever event is open now.
+async function goToCurrent() {
+  $app.innerHTML = `<div class="page"><p class="note" style="padding:40px">Loading…</p></div>`;
+  let live = [];
+  try { live = openEvents(await listEvents()); } catch (e) {}
+  if (live.length === 1) { location.replace(`${baseUrl()}#/e/${encodeURIComponent(live[0].id)}`); return; }
+  if (live.length > 1) {
+    $app.innerHTML = `<div class="page"><header class="band">${LOGO}${WAVE(390)}</header><main class="content"><div class="rule"></div><h1>which event are <em>you at?</em></h1>
+      <div class="evpick">${live.map(e => `<a href="#/e/${encodeURIComponent(e.id)}"><b>${esc(e.name)}</b><small>${esc(fmtDate(e.date))}</small></a>`).join('')}</div></main></div>`;
+    return;
+  }
+  $app.innerHTML = `<div class="page"><header class="band">${LOGO}${WAVE(390)}</header><main class="content"><div class="rule"></div><h1>see you at the <em>next event</em></h1>
+    <p class="note">We're not taking orders right now.</p></main></div>`;
+}
+
 // ---------- router ----------
-// Setup and catalog pages set leaveGuard while they hold unsaved changes.
+// Setup and form builder pages set leaveGuard while they hold unsaved changes.
 let leaveGuard = null, lastHash = location.hash;
 async function route() {
   if (leaveGuard && leaveGuard() && location.hash !== lastHash && !confirm('Leave without saving your changes?')) { history.replaceState(null, '', lastHash || '#/'); return; }
@@ -239,28 +267,17 @@ async function route() {
   cleanup();
   const [view, a, b] = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   window.scrollTo(0, 0);
-  if (view) await loadCatalog();
+  await loadCatalog();
+  if (view === 'go') return goToCurrent();
   if (view === 'e' && a) return guestForm(a);
   if (view === 'o' && a && b) return statusPage(a, b);
   if (view === 'board' && a) return boardGate(a);
-  if (view === 'staff') return staffSignIn(a);
   if (view === 'admin') return staffGate(() => a ? setupPage(a) : adminPage());
   if (view === 'photos') return staffGate(photosPage);
   if (view === 'catalog') return staffGate(catalogPage);
-  return homePage();
+  return staffSignIn(view === 'staff' ? a : undefined);
 }
 addEventListener('hashchange', route);
-
-function homePage() {
-  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">ivelisse orders</div>${WAVE(390)}</header>
-    <main class="content"><div class="rule"></div><h1>live <em>personalization</em></h1>
-    <p class="note">Guests reach their event by scanning its QR code.</p>
-    <a class="btn" href="#/staff">Event staff sign in</a>
-    <a class="btn out" href="#/admin">Event setup</a>
-    <p class="note" style="font-size:.8125rem">Event setup is for Steph and DeVaughn.</p>
-    <details class="pastev"><summary>Try the demo</summary><div class="btnrow"><a class="btn out" href="#/board/demo">Demo board</a><a class="btn out" href="#/e/demo">Demo guest form</a></div>
-      <p class="note" style="font-size:.8125rem;margin-top:8px">Sample orders, no sign-in. Use "reset demo" on the board to start over.</p></details></main></div>`;
-}
 
 // ---------- guest form ----------
 async function guestForm(eventId) {
@@ -399,9 +416,10 @@ async function guestForm(eventId) {
 async function statusPage(eventId, orderId) {
   $app.innerHTML = `<div class="page"><p class="note" style="padding:40px">Loading…</p></div>`;
   await ensureGuest();
-  let ev = null, order = null, queue = null, connected = true, lastSig = '';
+  let ev = null, order = null, queue = null, connected = true, lastSig = '', brand = {};
   // Don't hold the page on the event details; the order itself is what the guest is waiting for.
   getDoc(doc(db, 'events', eventId)).then(s => { ev = s.exists() ? s.data() : null; render(); }).catch(() => {});
+  getDoc(brandRef(eventId)).then(s => { brand = s.exists() ? s.data() : {}; render(); }).catch(() => {});
   const link = `${baseUrl()}#/o/${encodeURIComponent(eventId)}/${orderId}`;
 
   function aheadText(n) { return n === 0 ? "you're next" : `${n} ${n === 1 ? 'piece' : 'pieces'} ahead of yours`; }
@@ -418,23 +436,22 @@ async function statusPage(eventId, orderId) {
     let html;
     if (s === 'done' || s === 'picked') {
       const pick = ev?.pickupNote || 'at the engraving table';
-      html = `<header class="band readyband">${LOGO}
+      html = `<header class="band readyband">${brandCorners(brand)}${LOGO}
         ${s === 'done' ? `<h1 style="margin-top:8px">it's <em>ready!</em></h1><div style="font-size:1.0625rem;margin-top:6px">pick it up ${esc(pick)}</div><div class="code">${shortId(orderId)}</div><div style="font-size:.875rem;margin-top:8px">show this code</div>`
         : `<h1 style="margin-top:8px">enjoy it, <em>${esc(order.name)}</em></h1><div style="font-size:1.0625rem;margin-top:6px">thanks for celebrating with us</div>`}${WAVE(390)}</header>
-        <main class="content"><div class="proof"><span class="ph">${previewHTML(ev, order)}</span><div style="font:800 1.125rem var(--body)">${esc(order.name)}</div><div style="font-size:.875rem;color:var(--muted)">${order.engraver ? 'made by ' + esc(order.engraver) : ''}${tsDate(order.doneAt) ? ' • ' + fmtTime(tsDate(order.doneAt)) : ''}</div></div></main>
+        <main class="content"><div class="proof"><span class="ph">${previewHTML(ev, order)}</span><div style="font:800 1.125rem var(--body)">${esc(order.name)}</div><div style="font-size:.875rem;color:var(--muted)">${order.engraver ? 'made by ' + esc(order.engraver) : ''}${tsDate(order.doneAt) ? ' • ' + fmtTime(tsDate(order.doneAt)) : ''}</div></div>${brandBottom(brand)}</main>
         <div class="bar"><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Personalize another piece</a></div>`;
     } else {
       const state = s === 'progress'
         ? `<div class="eyebrow">it's happening</div><h1>${esc(order.engraver || 'we')} ${order.engraver ? 'is' : 'are'} <em>${order.service === 'calligraphy' ? 'lettering' : 'engraving'}</em> yours</h1>`
         : (pos >= 0 ? `<div class="eyebrow">you're in line</div>${pos === 0 ? `<h1>you're <em>next</em></h1>` : `<div class="big" aria-hidden="true">${pos}</div><h1 style="font-size:1.5rem;margin-top:4px" aria-hidden="true">${pos === 1 ? 'piece' : 'pieces'} ahead of <em>yours</em></h1><p class="note" style="margin-top:6px">you're #${pos + 1} in line</p>`}`
           : `<div class="eyebrow">you're in line</div><h1>${queue === null ? 'finding your <em>place</em>…' : `we've got <em>yours</em>`}</h1>`);
-      html = `<header class="band">${LOGO}<div class="ev">order ${shortId(orderId)}</div>${WAVE(390)}</header>
+      html = `<header class="band">${brandCorners(brand)}${LOGO}<div class="ev">order ${shortId(orderId)}</div>${WAVE(390)}</header>
         <main class="content"><div class="state">${state}</div>
         <p class="vh" role="status" aria-atomic="true" id="announce"></p>
-        ${miles}${item}${order.phone ? `<p class="note" style="font-size:.875rem">We'll text ${esc(fmtPhone(order.phone))} when it's ready.</p>` : ''}${save}${live}</main>`;
+        ${miles}${item}${order.phone ? `<p class="note" style="font-size:.875rem">We'll text ${esc(fmtPhone(order.phone))} when it's ready.</p>` : ''}${save}${live}${brandBottom(brand)}</main>`;
     }
-    $app.innerHTML = `<div class="page">${html}</div>${textButtonHTML()}`;
-    const tb = document.getElementById('txtsim'); if (tb) tb.onclick = () => showTextSim(ev, order, pos, link);
+    $app.innerHTML = `<div class="page">${html}</div>`;
     const ann = document.getElementById('announce');
     if (ann && sig !== lastSig) ann.textContent = s === 'progress' ? `${order.engraver || 'Your engraver'} is working on your piece.` : (pos >= 0 ? (pos === 0 ? "You're next." : aheadText(pos) + '.') : "You're in line.");
     if (sig !== lastSig && lastSig && s === 'done') { try { navigator.vibrate && navigator.vibrate([200, 100, 200]); } catch (e) {} document.title = '✓ Ready — Ivelisse'; }
@@ -737,16 +754,15 @@ async function boardPage(eventId) {
         <div class="k"><span><b>${n.q}</b>waiting</span><span><b>${n.p}</b>in progress</span><span><b>${n.x}</b>picked up</span>
           <button class="pu" id="openpk" type="button">Find by code ›</button>
           <span class="lv ${online() ? '' : 'off'}"><i aria-hidden="true"></i>${online() ? 'Live' : 'Offline • moves save on this iPad'}</span>
-          ${me ? `<span class="whoami">You're ${esc(me)} · <a href="#/staff/${encodeURIComponent(eventId)}">switch</a></span>` : `<a href="#/staff/${encodeURIComponent(eventId)}">pick your name</a>`}
-          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}${mgr ? `<a href="#/admin/${encodeURIComponent(eventId)}">event setup</a>` : ''}</div>${WAVE(1180)}</header>
+          ${mgr ? `<a href="#/admin/${encodeURIComponent(eventId)}">events</a>` : ''}</div>${WAVE(1180)}</header>
       <main class="lanes">
-        <section class="lane q" aria-label="Queue"><h2>queue <small>first in line at the top</small></h2>
+        <section class="lane q" aria-label="Queue"><h2>queue <small>${n.q}</small></h2>
           <div class="drop" data-status="queue" data-engraver="">${q.map(queueCard).join('') || '<p class="note">No one waiting.</p>'}</div></section>
-        ${names.map(e => { const h = holding(e); const made = orders.filter(o => (o.status === 'done' || o.status === 'picked') && o.engraver === e);
-          return `<section class="lane staff ${e === me ? 'mine' : ''}" aria-label="${esc(e)}"><h2><span>${esc(e.toLowerCase())}${e === me ? ' <small class="you">you</small>' : ''}</span> <small>${h.length ? h.length + ' on deck' : 'free'}</small></h2>
-            <div class="drop zone" data-status="progress" data-engraver="${esc(e)}">${h.map(nowCard).join('')}<div class="free"><div><b>free</b>tap a name on a queue card<br>or drag one here</div></div></div>
-            <details class="eng"><summary>Made (${made.length})</summary><ul>${made.slice().reverse().map(o => `<li>${esc(o.name)} • #${shortId(o.id)} • ${o.status === 'picked' ? 'picked up' : 'waiting for pickup'}</li>`).join('')}</ul></details></section>`; }).join('')}
-        <section class="lane ready" aria-label="Ready for pickup"><h2>ready <small>${n.r} to pick up</small></h2>
+        ${names.map(e => { const h = holding(e); 
+          return `<section class="lane staff ${e === me ? 'mine' : ''}" aria-label="${esc(e)}"><h2><span>${esc(e.toLowerCase())}${e === me ? ' <small class="you">you</small>' : ''}</span> <small>${h.length || ''}</small></h2>
+            <div class="drop zone" data-status="progress" data-engraver="${esc(e)}">${h.map(nowCard).join('')}<div class="free"><div><b>free</b></div></div></div>
+            </section>`; }).join('')}
+        <section class="lane ready" aria-label="Ready for pickup"><h2>ready <small>${n.r}</small></h2>
           <div class="drop" data-status="done" data-engraver="">${ready.map(readyCard).join('') || '<p class="note">Nothing waiting for pickup.</p>'}</div></section>
       </main>
       <dialog class="pickup" id="pk" aria-labelledby="pkt"><div class="pk-in">
@@ -774,7 +790,6 @@ async function boardPage(eventId) {
     document.querySelectorAll('[data-return]').forEach(b => b.onclick = () => move(b.dataset.return, 'queue'));
     document.querySelectorAll('[data-ready]').forEach(b => b.onclick = () => move(b.dataset.ready, 'done'));
     document.querySelectorAll('[data-picked]').forEach(b => b.onclick = () => pickedUp(b.dataset.picked));
-    const rs = document.getElementById('resetdemo'); if (rs) rs.onclick = e => { e.preventDefault(); confirmResetDemo(true); };
     const d = document.getElementById('pk');
     document.getElementById('openpk').onclick = () => { d.showModal(); renderPickup(); document.getElementById('find').focus(); };
     document.getElementById('pkx').onclick = () => { d.close(); document.getElementById('openpk').focus(); };
@@ -831,7 +846,7 @@ const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${Stri
 const guestUrl = id => `${baseUrl()}#/e/${encodeURIComponent(id)}`;
 const qrSvg = url => { const q = qrcode(0, 'M'); q.addData(url); q.make(); return q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }); };
 function downloadQr(url, name) { const q = qrcode(0, 'M'); q.addData(url); q.make(); const l = document.createElement('a'); l.href = q.createDataURL(12, 4); l.download = `qr-${name}.gif`; l.click(); }
-const STAFF_TABS = [['setup', '#/admin', 'Event setup'], ['catalog', '#/catalog', 'Catalog'], ['photos', '#/photos', 'Photos']];
+const STAFF_TABS = [['setup', '#/admin', 'Events'], ['catalog', '#/catalog', 'Form builder'], ['photos', '#/photos', 'Photos']];
 const staffHead = (title, tab) => `<header class="band">${LOGO}<div class="ev">${esc(title)}</div>${WAVE(1180)}</header>
   <nav class="snav" aria-label="Staff"><a class="tostaff" href="#/staff">‹ Event staff sign in</a>${STAFF_TABS.map(([k, h, l]) => `<a href="${h}" ${k === tab ? 'aria-current="page"' : ''}>${l}</a>`).join('')}<span>${esc(user.email)}</span><a href="#" id="out">Sign out</a></nav>`;
 function bindStaffHead() { const o = document.getElementById('out'); if (o) o.onclick = e => { e.preventDefault(); signOut(auth).then(() => { location.hash = '#/'; }); }; }
@@ -844,36 +859,82 @@ const byDateDesc = (a, b) => String(b.date || '').localeCompare(String(a.date ||
 const setupFrom = src => ({ engravers: [...(src.engravers || [])], pickupNote: src.pickupNote || 'at the engraving table',
   items: Object.fromEntries(allPieces().map(({ it }) => [it.id, offered(src, it.id)])), hidden: dropHidden(src.hidden) });
 
+// ---------- branding images ----------
+// Logos shrink to a small PNG (keeps transparency) stored in the event's public branding doc.
+async function fileToLogo(file, max = 360) {
+  const src = URL.createObjectURL(file);
+  try {
+    const img = new Image(); img.src = src; await img.decode();
+    let size = max, out = '';
+    for (let i = 0; i < 4; i++) {
+      const s = Math.min(1, size / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(img.naturalWidth * s)); c.height = Math.max(1, Math.round(img.naturalHeight * s));
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      out = c.toDataURL('image/png');
+      if (out.length < 250000) return out;
+      size = Math.round(size * 0.7);
+    }
+    return out;
+  } finally { URL.revokeObjectURL(src); }
+}
+const BRAND_SLOTS = [['tl', 'Top left'], ['tr', 'Top right'], ['bc', 'Bottom center']];
+const brandRef = id => doc(db, 'events', id, 'public', 'branding');
+const brandCorners = b => `${b?.tl ? `<img class="bcorner tl" src="${esc(b.tl)}" alt="">` : ''}${b?.tr ? `<img class="bcorner tr" src="${esc(b.tr)}" alt="">` : ''}`;
+const brandBottom = b => b?.bc ? `<div class="bbottom"><img src="${esc(b.bc)}" alt=""></div>` : '';
+
+const goUrl = () => `${baseUrl()}#/go`;
+
+// New event, optionally reusing another event's staff, pickup spot, menu and branding.
+async function createEvent(name, date, src) {
+  // Never overwrite an existing event that happens to share the name and date.
+  const base = slug(`${name}-${date}`) || 'event'; let id = base;
+  for (let n = 2; (await getDoc(doc(db, 'events', id))).exists(); n++) id = `${base}-${n}`;
+  const setup = src ? setupFrom(src) : { engravers: ['Steph'], pickupNote: 'at the engraving table', items: Object.fromEntries(allPieces().map(({ it }) => [it.id, true])), hidden: {} };
+  await setDoc(doc(db, 'events', id), { name, date, ...setup, photos: {}, open: true, createdAt: serverTimestamp(), ...(src ? { copiedFrom: src.id } : {}) });
+  if (src) { try { const b = await getDoc(brandRef(src.id)); if (b.exists()) await setDoc(brandRef(id), b.data()); } catch (x) {} }
+  return id;
+}
+
 async function adminPage() {
   $app.innerHTML = staffLoading('Loading events…');
-  let evs;
-  try { evs = await listEvents(); }
+  let evs, pin = '';
+  try { [evs, pin] = await Promise.all([listEvents(), loadPin()]); }
   catch (e) { $app.innerHTML = `<div class="wrap"><p class="err">Could not load events: ${esc(e.code || e.message)}</p></div>`; return; }
   const today = todayStr();
   const real = evs.filter(e => e.id !== DEMO_ID);
-  const upcoming = real.filter(e => (e.date || '') >= today).sort((a, b) => -byDateDesc(a, b));
-  const past = real.filter(e => (e.date || '') < today).sort(byDateDesc);
-  const demo = evs.find(e => e.id === DEMO_ID);
-  const card = ev => `<a class="evcard" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} staff · ${allPieces().filter(p => offered(ev, p.it.id)).length} pieces</span></div>
-    <span class="chip ${ev.open === false ? '' : 'on'}">${ev.open === false ? 'Closed' : 'Taking orders'}</span><span class="chev" aria-hidden="true">›</span></a>`;
-  $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap">
-    <h1>event <em>setup</em></h1>
-    <form id="new" class="card newev"><h2>new event</h2>
-      <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
-      <div class="field"><label class="lbl" for="n-date">Date</label><input id="n-date" type="date" required value="${today}"></div>
-      <div class="field wide"><label class="lbl" for="n-from">Start from</label><select id="n-from"><option value="">Everything in the catalog</option>
-        ${real.slice().sort(byDateDesc).map(e => `<option value="${esc(e.id)}">Copy ${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select>
-        <span class="hint">Copying brings over the staff names, pickup spot, and which pieces and choices are offered.</span></div>
-      <button class="btn">Create and set up</button></form>
-    <h2 class="sec">upcoming</h2><div class="evlist">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled. Create one above.</p>'}</div>
+  const live = openEvents(evs), isLive = ev => live.some(e => e.id === ev.id);
+  const upcoming = real.filter(e => (e.date || '') >= addDays(today, -1)).sort((a, b) => -byDateDesc(a, b));
+  const past = real.filter(e => (e.date || '') < addDays(today, -1)).sort(byDateDesc);
+  const card = ev => `<a class="evcard ${isLive(ev) ? 'islive' : ''}" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} staff</span></div>
+    ${isLive(ev) ? '<span class="chip live">Live now</span>' : `<span class="chip ${ev.open === false ? '' : 'on'}">${ev.open === false ? 'Closed' : 'Open'}</span>`}<span class="chev" aria-hidden="true">›</span></a>`;
+  $app.innerHTML = `${staffHead('events', 'setup')}<main class="wrap">
+    <h1>events</h1>
+    <div class="toprow">
+      <section class="card"><h2>staff PIN</h2>
+        <div class="pinedit"><label class="vh" for="pinin">Staff PIN</label><input id="pinin" class="pinfield" inputmode="numeric" pattern="[0-9]*" maxlength="4" value="${esc(pin)}"><button class="btn" id="pinsave" type="button" disabled>Save</button></div>
+        <p class="hint">Same PIN every event. Works only while an event is open.</p></section>
+      <section class="card"><h2>guest QR</h2>
+        <div class="share"><div class="qr" aria-label="QR code for the guest form">${qrSvg(goUrl())}</div>
+          <div class="shareinfo"><p class="hint" style="margin:0">Print once. ${live.length > 1 ? 'Two events are open, so guests pick theirs.' : live.length ? `Opens <b>${esc(live[0].name)}</b> right now.` : 'Opens whichever event is open.'}</p>
+            <button class="btn out" id="dlqr" type="button">Download QR</button><button class="btn out" id="copy" type="button">Copy link</button></div></div></section>
+    </div>
+    <h2 class="sec">events</h2>
+    <div class="evlist">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled.</p>'}</div>
+    <details class="newev card" ${upcoming.length ? '' : 'open'}><summary>+ New event</summary>
+      <form id="new">
+        <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
+        <div class="field"><label class="lbl" for="n-date">Date</label><input id="n-date" type="date" required value="${today}"></div>
+        <div class="field wide"><label class="lbl" for="n-from">Start from</label><select id="n-from"><option value="">Blank: every piece on</option>
+          ${real.slice().sort(byDateDesc).map(e => `<option value="${esc(e.id)}">Copy ${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select></div>
+        <button class="btn">Create event</button></form></details>
     ${past.length ? `<details class="pastev"><summary>Past events (${past.length})</summary><div class="evlist">${past.map(card).join('')}</div></details>` : ''}
-    <h2 class="sec">practice</h2>
-    ${demo ? `<div class="evlist">${card(demo)}</div><button class="linkbtn" id="rsdemo" type="button">Reset demo orders</button>`
-      : `<p class="note" style="text-align:left">A demo event comes with sample orders in every stage, to try the board.</p><button class="btn out" id="mkdemo" type="button" style="margin-top:10px;width:100%">Create demo event</button>`}
   </main>`;
   bindStaffHead();
-  const mk = document.getElementById('mkdemo'); if (mk) mk.onclick = async () => { mk.disabled = true; if (await confirmResetDemo(false)) adminPage(); else mk.disabled = false; };
-  const rs = document.getElementById('rsdemo'); if (rs) rs.onclick = () => confirmResetDemo(true);
+  const pinIn = document.getElementById('pinin'), pinSave = document.getElementById('pinsave');
+  pinIn.oninput = () => { pinIn.value = pinIn.value.replace(/\D/g, '').slice(0, 4); pinSave.disabled = pinIn.value.length !== 4 || pinIn.value === pin; };
+  pinSave.onclick = async () => { pinSave.disabled = true; try { await setDoc(pinRef(), { pin: pinIn.value, updatedAt: serverTimestamp() }); pin = pinIn.value; toast('PIN saved'); } catch (err) { pinSave.disabled = false; toast('Could not save: ' + (err.code || err.message)); } };
+  document.getElementById('dlqr').onclick = () => downloadQr(goUrl(), 'ivelisse-orders');
+  document.getElementById('copy').onclick = () => (navigator.clipboard?.writeText(goUrl()) || Promise.reject()).then(() => toast('Guest link copied')).catch(() => toast(goUrl()));
   document.getElementById('new').onsubmit = async e => {
     e.preventDefault();
     const name = document.getElementById('n-name').value.trim(), date = document.getElementById('n-date').value;
@@ -881,12 +942,7 @@ async function adminPage() {
     const src = evs.find(x => x.id === document.getElementById('n-from').value);
     const btn = e.target.querySelector('.btn'); btn.disabled = true;
     try {
-      // Never overwrite an existing event that happens to share the name and date.
-      const base = slug(`${name}-${date}`) || 'event'; let id = base;
-      for (let n = 2; (await getDoc(doc(db, 'events', id))).exists(); n++) id = `${base}-${n}`;
-      const setup = src ? setupFrom(src) : { engravers: ['Steph', 'Veronica', 'Christina', 'DeVaughn'], pickupNote: 'at the engraving table', items: Object.fromEntries(allPieces().map(({ it }) => [it.id, true])), hidden: {} };
-      await setDoc(doc(db, 'events', id), { name, date, ...setup, photos: {}, open: true, createdAt: serverTimestamp(), ...(src ? { copiedFrom: src.id } : {}) });
-      await setDoc(doc(db, 'events', id, 'private', 'access'), { pin: newPin(), updatedAt: serverTimestamp() });
+      const id = await createEvent(name, date, src);
       location.hash = `#/admin/${encodeURIComponent(id)}`;
     } catch (err) { btn.disabled = false; toast('Could not create: ' + (err.code || err.message)); }
   };
@@ -894,63 +950,78 @@ async function adminPage() {
 
 async function setupPage(eventId) {
   $app.innerHTML = staffLoading('Loading event…');
-  let ev = null, others = [];
+  let ev = null, others = [], brand = {};
   try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
-  if (!ev) { $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
+  if (!ev) { $app.innerHTML = `${staffHead('events', 'setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
   try { others = (await listEvents()).filter(e => e.id !== eventId && e.id !== DEMO_ID).sort(byDateDesc); } catch (e) {}
-  // Each event has a staff PIN. Events made before PINs existed get one the first time they're opened here.
-  let pin = '';
-  if (eventId !== DEMO_ID) try {
-    const ps = await getDoc(doc(db, 'events', eventId, 'private', 'access'));
-    pin = ps.exists() ? ps.data().pin : '';
-    if (!pin) { pin = newPin(); await setDoc(doc(db, 'events', eventId, 'private', 'access'), { pin, updatedAt: serverTimestamp() }); }
-  } catch (e) {}
+  try { const b = await getDoc(brandRef(eventId)); brand = b.exists() ? b.data() : {}; } catch (e) {}
   const st = { name: ev.name || '', date: ev.date || '', open: ev.open !== false, ...setupFrom(ev) };
-  let savedEngravers = [...st.engravers], dirty = false, saving = false, savedName = st.name;
-  const url = guestUrl(eventId);
+  let savedEngravers = [...st.engravers], dirty = false, saving = false, savedName = st.name, savedOpen = st.open;
   const legacy = Object.keys(ev.photos || {}).length;
   leaveGuard = () => dirty;
 
-  const chipsHTML = () => st.engravers.map((e, i) => `<span>${esc(e)}<button type="button" data-rm="${i}" aria-label="Remove ${esc(e)}">×</button></span>`).join('') || '<em class="note">No engravers yet.</em>';
+  const chipsHTML = () => st.engravers.map((e, i) => `<span>${esc(e)}<button type="button" data-rm="${i}" aria-label="Remove ${esc(e)}">×</button></span>`).join('') || '<em class="note">No staff yet.</em>';
   const pieceRow = it => {
     const on = st.items[it.id] === true;
     const shown = { ...ev, items: st.items, hidden: st.hidden };
     return `<div class="prow ${on ? 'on' : ''}"><label class="ptop"><span class="ph">${previewHTML(shown, { item: it.id, opts: firstOpts(shown, it) }, false)}</span>
-      <span class="pn"><span><input type="checkbox" data-item="${esc(it.id)}" ${on ? 'checked' : ''}> <b>${esc(it.label)}</b></span><small>${on ? (it.groups.length ? 'Tap a choice to turn it off for this event.' : 'No options; guests just add a name.') : 'Not offered at this event'}</small></span></label>
+      <span class="pn"><span><input type="checkbox" data-item="${esc(it.id)}" ${on ? 'checked' : ''}> <b>${esc(it.label)}</b></span>${on ? '' : '<small>Off</small>'}</span></label>
       ${on ? it.groups.map(g => `<div class="cgrp"><span class="gl">${esc(g.label)}</span><div class="cchips">${g.choices.map(c => { const path = `${it.id}/${g.id}/${c.id}`, off = st.hidden[path] === true;
         return `<button type="button" class="cc" aria-pressed="${!off}" data-ch="${esc(path)}">${g.swatch ? `<i style="background:${esc(c.color || SWATCH[c.id] || '#ccc')}"></i>` : ''}${esc(c.label)}</button>`; }).join('')}</div></div>`).join('') : ''}</div>`;
   };
+  const brandPreview = () => `<div class="phonebox" aria-label="Preview of the page guests see after ordering"><div class="pb-band">${brandCorners(brand)}<img class="logo" src="logo.png" alt=""><div class="ev">order K7Q2</div></div>
+    <div class="pb-body"><div class="eyebrow">you're in line</div><div class="pb-big">2</div><div class="pb-line"></div><div class="pb-line short"></div>${brandBottom(brand)}</div></div>`;
+  const brandSlots = () => BRAND_SLOTS.map(([k, l]) => `<div class="bslot"><span class="lbl">${l}</span>
+    <div class="bthumb">${brand[k] ? `<img src="${esc(brand[k])}" alt="">` : '<span>none</span>'}</div>
+    <label class="btn out bup">${brand[k] ? 'Replace' : 'Upload'}<input type="file" accept="image/*" data-up="${k}" hidden></label>
+    ${brand[k] ? `<button type="button" class="linkbtn" data-rmb="${k}">Remove</button>` : ''}</div>`).join('');
 
   function render() {
-    $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap setup">
+    const y = scrollY;
+    $app.innerHTML = `${staffHead('events', 'setup')}<main class="wrap setup">
       <a class="backlink" href="#/admin">‹ All events</a>
-      <h1>${esc(savedName)}</h1>
-      <div class="btnrow"><a class="btn" href="#/board/${encodeURIComponent(eventId)}">Open board</a><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Preview guest form</a></div>
-      ${others.length ? `<section class="card"><h2>copy from another event</h2><p class="hint">Brings over staff names, pickup spot, and pieces and choices. Name, date, and orders stay as they are. Nothing saves until you tap Save.</p>
-        <div class="addrow"><label class="vh" for="cp-from">Event to copy</label><select id="cp-from">${others.map(e => `<option value="${esc(e.id)}">${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select><button class="btn out" id="cp" type="button">Copy</button></div></section>` : ''}
-      <section class="card"><h2>details</h2>
-        <div class="field"><label class="lbl" for="s-name">Event name</label><input id="s-name" value="${esc(st.name)}"></div>
-        <div class="field"><label class="lbl" for="s-date">Date</label><input id="s-date" type="date" value="${esc(st.date)}"></div>
-        <div class="field"><label class="lbl" for="s-pick">Where guests pick up (finishes "pick it up …")</label><input id="s-pick" value="${esc(st.pickupNote)}"></div>
-        <label class="tog"><input type="checkbox" id="s-open" ${st.open ? 'checked' : ''}> Taking orders <small>Turn off to close the guest form. Pieces already ordered still show on the board.</small></label></section>
-      <section class="card"><h2>event staff</h2><p class="hint">Staff pick one of these names at Event staff sign in. Each name gets a column on the board, and up to 3 names show as assign buttons on every queue card.</p>
+      <div class="evhead"><h1>${esc(savedName)}</h1><span class="chip ${savedOpen ? 'on' : ''}">${savedOpen ? 'Open' : 'Closed'}</span></div>
+      ${!savedOpen ? `<section class="card reuse"><button class="btn" id="reuse" type="button">Reuse this event setup</button>
+        <form id="reuseform" hidden><p class="hint">Same staff, menu, pickup spot and branding. No orders.</p>
+          <div class="two"><div class="field"><label class="lbl" for="r-name">New event name</label><input id="r-name" required value="${esc(savedName)}"></div>
+          <div class="field"><label class="lbl" for="r-date">Date</label><input id="r-date" type="date" required value="${todayStr()}"></div></div>
+          <button class="btn">Create event</button></form></section>` : ''}
+      <div class="btnrow"><a class="btn ${savedOpen ? '' : 'out'}" href="#/board/${encodeURIComponent(eventId)}">Open board</a><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Preview guest form</a></div>
+      ${others.length ? `<div class="copyrow"><label class="lbl" for="cp-from">Copy setup from</label><div class="addrow"><select id="cp-from">${others.map(e => `<option value="${esc(e.id)}">${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select><button class="btn out" id="cp" type="button">Copy</button></div></div>` : ''}
+
+      <section class="card step"><h2><span class="n">1</span>details</h2>
+        <div class="two"><div class="field"><label class="lbl" for="s-name">Event name</label><input id="s-name" value="${esc(st.name)}"></div>
+          <div class="field"><label class="lbl" for="s-date">Date</label><input id="s-date" type="date" value="${esc(st.date)}"></div></div>
+        <div class="field"><label class="lbl" for="s-pick">Pickup spot</label><input id="s-pick" value="${esc(st.pickupNote)}" placeholder="at the engraving table"></div></section>
+
+      <section class="card step"><h2><span class="n">2</span>staff</h2>
         <div class="chips" id="chips">${chipsHTML()}</div>
-        <div class="addrow"><label class="vh" for="s-eng">Add a staff name</label><input id="s-eng" placeholder="First name" autocapitalize="words"><button class="btn out" id="addeng" type="button">Add</button></div>
-        ${eventId === DEMO_ID ? '<p class="hint" style="margin-top:12px">The demo needs no PIN.</p>' : `<div class="pinrow"><div><div class="lbl">Staff PIN</div><div class="pinshow">${esc(pin || '····')}</div></div><button class="btn out" id="newpin" type="button">New PIN</button></div>
-        <p class="hint">Staff enter it once per device. A new PIN doesn't sign out anyone already in.</p>`}</section>
-      <section class="card"><h2>pieces &amp; choices</h2><p class="hint">Check the pieces this event offers, then tap any choice to switch it off here only. To add pieces or choices, edit the <a href="#/catalog">catalog</a>.</p>
-        ${CAT.categories.filter(c => c.items.length).map(c => `<h3 class="cathead">${esc(c.label)}</h3>${c.items.map(pieceRow).join('')}`).join('') || '<p class="note">The catalog is empty.</p>'}</section>
-      <section class="card"><h2>guest link &amp; QR</h2>
-        <div class="share"><div class="qr" aria-label="QR code for the guest form">${qrSvg(url)}</div>
-          <div class="shareinfo"><div class="url">${esc(url)}</div><div class="btnrow"><button class="btn out" id="copy" type="button">Copy link</button><button class="btn out" id="dlqr" type="button">Download QR to print</button></div></div></div></section>
-      <section class="card"><h2>after the event</h2><p class="hint">Orders with times for each step, as a file Google Sheets opens.</p>
+        <div class="addrow"><label class="vh" for="s-eng">Add a staff name</label><input id="s-eng" placeholder="First name" autocapitalize="words"><button class="btn out" id="addeng" type="button">Add</button></div></section>
+
+      <section class="card step"><h2><span class="n">3</span>menu <a class="h2link" href="#/catalog">Form builder ›</a></h2>
+        ${CAT.categories.filter(c => c.items.length).map(c => `<h3 class="cathead">${esc(c.label)}</h3>${c.items.map(pieceRow).join('')}`).join('') || '<p class="note">No pieces yet. Add them in the Form builder.</p>'}</section>
+
+      <section class="card step"><h2><span class="n">4</span>branding</h2>
+        <div class="brandgrid"><div class="bslots">${brandSlots()}</div>${brandPreview()}</div></section>
+
+      <section class="card step"><h2><span class="n">5</span>open or close</h2>
+        <div class="openseg" role="radiogroup" aria-label="Event status">
+          <button type="button" role="radio" aria-checked="${st.open}" data-open="1"><b>Open</b><small>Guests order. Staff PIN works.</small></button>
+          <button type="button" role="radio" aria-checked="${!st.open}" data-open="0"><b>Closed</b><small>Form closed. PIN stops working.</small></button></div></section>
+
+      <section class="card step"><h2><span class="n">6</span>after the event</h2>
         <button class="btn out" id="export" type="button">Export orders</button>
-        ${legacy ? `<p class="hint" style="margin-top:14px">This event still has ${legacy} photo link${legacy === 1 ? '' : 's'} from the old setup, which override the photo library.</p><button class="linkbtn" id="clearlegacy" type="button">Remove old photo links</button>` : ''}</section>
+        ${legacy ? `<button class="linkbtn" id="clearlegacy" type="button" style="margin-left:12px">Remove ${legacy} old photo link${legacy === 1 ? '' : 's'}</button>` : ''}</section>
     </main>
     <div class="savebar"><span id="dirty">${dirty ? 'Unsaved changes' : 'All changes saved'}</span><button class="btn" id="save" type="button" ${dirty ? '' : 'disabled'}>Save</button></div>`;
-    bind();
+    bind(); scrollTo(0, y);
   }
   const markDirty = () => { dirty = true; document.getElementById('dirty').textContent = 'Unsaved changes'; document.getElementById('save').disabled = false; };
+  async function setBrand(k, val) {
+    const next = { ...brand }; if (val) next[k] = val; else delete next[k];
+    try { await setDoc(brandRef(eventId), { ...next, updatedAt: serverTimestamp() }); delete next.updatedAt; brand = next; render(); toast(val ? 'Image saved' : 'Image removed'); }
+    catch (err) { toast('Could not save the image: ' + (err.code || err.message)); }
+  }
   function bind() {
     bindStaffHead();
     const bindChips = () => document.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { st.engravers.splice(+b.dataset.rm, 1); document.getElementById('chips').innerHTML = chipsHTML(); bindChips(); markDirty(); });
@@ -964,15 +1035,19 @@ async function setupPage(eventId) {
     document.getElementById('addeng').onclick = addEng;
     engIn.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addEng(); } };
     [['s-name', 'name'], ['s-date', 'date'], ['s-pick', 'pickupNote']].forEach(([id, k]) => document.getElementById(id).oninput = e => { st[k] = e.target.value; markDirty(); });
-    document.getElementById('s-open').onchange = e => { st.open = e.target.checked; markDirty(); };
+    document.querySelectorAll('[data-open]').forEach(b => b.onclick = () => { st.open = b.dataset.open === '1'; document.querySelectorAll('[data-open]').forEach(x => x.setAttribute('aria-checked', String((x.dataset.open === '1') === st.open))); markDirty(); });
     document.querySelectorAll('[data-item]').forEach(c => c.onchange = () => { st.items[c.dataset.item] = c.checked; dirty = true; render(); });
     document.querySelectorAll('[data-ch]').forEach(b => b.onclick = () => { const p = b.dataset.ch; if (st.hidden[p]) delete st.hidden[p]; else st.hidden[p] = true; b.setAttribute('aria-pressed', String(!st.hidden[p])); markDirty(); });
+    document.querySelectorAll('[data-up]').forEach(inp => inp.onchange = async () => { const f = inp.files[0]; if (!f) return; try { await setBrand(inp.dataset.up, await fileToLogo(f)); } catch (err) { toast("That image couldn't be read. Try a PNG or JPG."); } });
+    document.querySelectorAll('[data-rmb]').forEach(b => b.onclick = () => setBrand(b.dataset.rmb, null));
     const cp = document.getElementById('cp');
-    if (cp) cp.onclick = () => { const src = others.find(e => e.id === document.getElementById('cp-from').value); if (!src) return; Object.assign(st, setupFrom(src)); dirty = true; render(); toast(`Copied setup from ${src.name}. Review it, then Save.`); };
-    document.getElementById('copy').onclick = () => (navigator.clipboard?.writeText(url) || Promise.reject()).then(() => toast('Guest link copied')).catch(() => toast(url));
-    document.getElementById('dlqr').onclick = () => downloadQr(url, eventId);
-    const np = document.getElementById('newpin');
-    if (np) np.onclick = async () => { const p = newPin(); try { await setDoc(doc(db, 'events', eventId, 'private', 'access'), { pin: p, updatedAt: serverTimestamp() }); pin = p; document.querySelector('.pinshow').textContent = p; toast('New staff PIN: ' + p); } catch (err) { toast('Could not change the PIN: ' + (err.code || err.message)); } };
+    if (cp) cp.onclick = () => { const src = others.find(e => e.id === document.getElementById('cp-from').value); if (!src) return; Object.assign(st, setupFrom(src)); dirty = true; render(); toast(`Copied from ${src.name}. Review, then Save.`); };
+    const ru = document.getElementById('reuse');
+    if (ru) ru.onclick = () => { ru.style.display = 'none'; const f = document.getElementById('reuseform'); f.hidden = false; document.getElementById('r-name').select(); };
+    const rf = document.getElementById('reuseform');
+    if (rf) rf.onsubmit = async e => { e.preventDefault(); const b = rf.querySelector('.btn'); b.disabled = true;
+      try { const id = await createEvent(document.getElementById('r-name').value.trim(), document.getElementById('r-date').value, { id: eventId, ...ev, ...st }); location.hash = `#/admin/${encodeURIComponent(id)}`; }
+      catch (err) { b.disabled = false; toast('Could not create: ' + (err.code || err.message)); } };
     document.getElementById('export').onclick = async () => { try { await exportOrders(eventId, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); } };
     const cl = document.getElementById('clearlegacy');
     if (cl) cl.onclick = async () => { try { await updateDoc(doc(db, 'events', eventId), { photos: {} }); ev.photos = {}; toast('Old photo links removed'); render(); } catch (err) { toast('Could not remove: ' + (err.code || err.message)); } };
@@ -983,20 +1058,20 @@ async function setupPage(eventId) {
     if (!st.name.trim() || !st.date) { toast('The event needs a name and a date.'); return; }
     if (!st.engravers.length) { toast('Add at least one staff name.'); return; }
     const on = allPieces().filter(({ it }) => st.items[it.id]);
-    if (!on.length) { toast('Offer at least one piece.'); return; }
+    if (!on.length) { toast('Turn on at least one piece.'); return; }
     const empty = on.flatMap(({ it }) => it.groups.filter(g => !g.choices.some(c => !st.hidden[`${it.id}/${g.id}/${c.id}`])).map(g => `${it.label}: ${g.label}`));
     if (empty.length) { toast(`Leave at least one choice on for ${empty[0]}.`); return; }
     saving = true; const b = document.getElementById('save'); b.disabled = true; b.textContent = 'Saving…';
     try {
-      // Removing an engraver hides their lane, so don't allow it while they have a piece in progress.
+      // Removing a staff name hides their column, so don't allow it while they hold a piece.
       const removed = savedEngravers.filter(e => !st.engravers.includes(e));
       if (removed.length) {
         const busy = (await getDocs(collection(db, 'events', eventId, 'orders'))).docs.map(d => d.data()).find(o => o.status === 'progress' && removed.includes(o.engraver));
-        if (busy) { toast(`${busy.engraver} has ${busy.name}'s piece in progress. Finish or move it before removing them.`); return; }
+        if (busy) { toast(`${busy.engraver} has ${busy.name}'s piece. Move it before removing them.`); return; }
       }
       await updateDoc(doc(db, 'events', eventId), { name: st.name.trim(), date: st.date, pickupNote: st.pickupNote.trim() || 'at the engraving table', open: st.open,
         engravers: st.engravers, items: st.items, hidden: dropHidden(st.hidden), updatedAt: serverTimestamp() });
-      savedEngravers = [...st.engravers]; savedName = st.name.trim(); dirty = false; render(); toast('Saved');
+      savedEngravers = [...st.engravers]; savedName = st.name.trim(); savedOpen = st.open; dirty = false; render(); toast('Saved');
     } catch (err) { toast('Could not save: ' + (err.code || err.message)); }
     finally { saving = false; const s = document.getElementById('save'); if (s) { s.textContent = 'Save'; s.disabled = !dirty; } }
   }
@@ -1006,98 +1081,185 @@ async function setupPage(eventId) {
   render();
 }
 
-// ---------- catalog editor ----------
+// ---------- form builder ----------
+// A branching view: category → pieces → questions → choices. Tap a branch to open what follows it; edit right on the branch.
+// Photos (piece, and each choice of a piece's first question) come from the camera, the camera roll, or the photo library.
+let libCache = null;
+async function photoLibrary() {
+  if (!libCache) libCache = (await getDocs(collection(db, 'photos'))).docs.map(d => ({ key: d.id, data: d.data().data })).filter(p => typeof p.data === 'string');
+  return libCache;
+}
+function photoSheet(label, key, onDone) {
+  const has = typeof photoLib[key] === 'string';
+  const d = document.createElement('dialog'); d.className = 'psheet';
+  const main = () => `<h3>photo · <em>${esc(label)}</em></h3>
+    <label class="btn">Take photo<input type="file" accept="image/*" capture="environment" data-file hidden></label>
+    <label class="btn out">Camera roll<input type="file" accept="image/*" data-file hidden></label>
+    <button class="btn out" type="button" data-lib>Photo library</button>
+    ${has ? '<button class="linkbtn danger" type="button" data-rm>Remove photo</button>' : ''}
+    <button class="linkbtn" type="button" data-x>Cancel</button>`;
+  d.innerHTML = main(); document.body.appendChild(d); d.showModal();
+  const close = () => { d.close(); d.remove(); };
+  const put = async data => {
+    d.innerHTML = '<p class="note">Saving…</p>';
+    try { await setDoc(doc(db, 'photos', key), { data, updatedAt: serverTimestamp(), by: user.email }); photoLib[key] = data; if (libCache) { libCache = libCache.filter(p => p.key !== key); libCache.push({ key, data }); } toast('Photo saved'); close(); onDone(); }
+    catch (err) { toast('Could not save: ' + (err.code || err.message)); close(); }
+  };
+  const bind = () => {
+    d.querySelectorAll('[data-file]').forEach(inp => inp.onchange = async () => { const f = inp.files[0]; if (!f) return; try { await put(await fileToJpeg(f)); } catch (e) { toast("That photo couldn't be read."); close(); } });
+    const lib = d.querySelector('[data-lib]');
+    if (lib) lib.onclick = async () => {
+      d.innerHTML = '<p class="note">Loading library…</p>';
+      let all = []; try { all = await photoLibrary(); } catch (e) {}
+      d.innerHTML = `<h3>photo <em>library</em></h3><div class="libgrid">${all.map((p, i) => `<button type="button" data-pick="${i}"><img src="${esc(p.data)}" alt=""></button>`).join('') || '<p class="note">No photos yet.</p>'}</div><button class="linkbtn" type="button" data-back>Back</button>`;
+      d.querySelectorAll('[data-pick]').forEach(b => b.onclick = () => put(all[+b.dataset.pick].data));
+      d.querySelector('[data-back]').onclick = () => { d.innerHTML = main(); bind(); };
+    };
+    const rm = d.querySelector('[data-rm]');
+    if (rm) rm.onclick = async () => { try { await deleteDoc(doc(db, 'photos', key)); photoLib[key] = null; if (libCache) libCache = libCache.filter(p => p.key !== key); toast('Photo removed'); } catch (err) { toast('Could not remove: ' + (err.code || err.message)); } close(); onDone(); };
+    d.querySelector('[data-x]')?.addEventListener('click', close);
+  };
+  bind();
+  d.addEventListener('cancel', e => { e.preventDefault(); close(); });
+}
+
 async function catalogPage() {
-  $app.innerHTML = staffLoading('Loading catalog…');
+  $app.innerHTML = staffLoading('Loading form…');
   await loadCatalog(true);
   const cat = JSON.parse(JSON.stringify(CAT));
-  const opened = new Set();
-  let dirty = false, saving = false;
+  // Load the photos the branches show, so nothing redraws while typing.
+  const keys = cat.categories.flatMap(c => c.items.flatMap(it => [it.id, ...(it.groups[0]?.choices || []).map(x => `${it.id}_${x.id}`)]));
+  await Promise.all(keys.filter(k => !(k in photoLib) || photoLib[k] === undefined).map(k => getDoc(doc(db, 'photos', k)).then(s => { photoLib[k] = s.exists() ? (s.data().data || null) : null; }).catch(() => { photoLib[k] = null; })));
+  photoRerender = null;
+  let dirty = false, saving = false, sc = 0, sp = 0, sq = 0;
   leaveGuard = () => dirty;
-  const DRAW = [['bagtag', 'Bag tag drawing'], ['tumbler', 'Tumbler drawing'], ['card', 'Card with the name']];
-  const at = el => { const d = el.closest('[data-ci]').dataset; return { c: cat.categories[+d.ci], it: d.ii != null ? cat.categories[+d.ci].items[+d.ii] : null }; };
-  const grp = el => at(el).it.groups[+el.closest('[data-gi]').dataset.gi];
-  const move = (arr, i, d) => { const j = i + d; if (j < 0 || j >= arr.length) return; [arr[i], arr[j]] = [arr[j], arr[i]]; };
-  const tools = (kind, i, n) => `<span class="tools"><button type="button" data-up="${kind}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button><button type="button" data-down="${kind}" ${i === n - 1 ? 'disabled' : ''} aria-label="Move down">↓</button><button type="button" data-del="${kind}" aria-label="Delete">×</button></span>`;
-
-  const groupHTML = (g, gi, n) => `<div class="gedit" data-gi="${gi}">
-    <div class="ghead"><label class="vh">Option group name</label><input class="gname" data-f="group" value="${esc(g.label)}" placeholder="e.g. Finish, Size, Detail">
-      <label class="sw-tog"><input type="checkbox" data-swatch ${g.swatch ? 'checked' : ''}> color dots</label>${tools('group', gi, n)}</div>
-    <div class="chlist">${g.choices.map((c, xi) => `<span class="chi" data-xi="${xi}">${g.swatch ? `<input type="color" data-f="color" value="${esc(c.color || SWATCH[c.id] || '#cccccc')}" aria-label="${esc(c.label)} color">` : ''}<input data-f="choice" value="${esc(c.label)}" aria-label="Choice name"><button type="button" data-del="choice" aria-label="Remove ${esc(c.label)}">×</button></span>`).join('') || '<em class="hint">No choices yet.</em>'}</div>
-    <div class="addrow"><input data-newchoice placeholder="Add a choice, e.g. Navy" aria-label="New choice"><button class="btn out" type="button" data-addchoice>Add</button></div></div>`;
-  const pieceHTML = (it, ci, ii, n) => `<details class="pedit" data-ci="${ci}" data-ii="${ii}" ${opened.has(it) ? 'open' : ''}>
-    <summary><span class="ph">${drawFor(it)}</span><span class="pn"><b>${esc(it.label || 'Untitled piece')}</b><small>${it.groups.map(g => `${esc(g.label)} (${g.choices.length})`).join(' · ') || 'no options'}</small></span>${tools('piece', ii, n)}</summary>
-    <div class="pbody">
-      <div class="two"><div class="field"><label class="lbl">Piece name</label><input data-f="piece" value="${esc(it.label)}" placeholder="e.g. Wine glass"></div>
-        <div class="field"><label class="lbl">Material line <span class="hint">optional, shown under the pieces</span></label><input data-f="material" value="${esc(it.material || '')}" placeholder="e.g. crystal"></div></div>
-      <div class="two"><div class="field"><label class="lbl">Preview when there's no photo</label><select data-f="preview">${DRAW.map(([k, l]) => `<option value="${k}" ${it.preview === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
-        <div class="field"><label class="lbl">Category</label><select data-movecat>${cat.categories.map((c, j) => `<option value="${j}" ${j === ci ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}</select></div></div>
-      <h4 class="gtitle">Option groups <span class="hint">guests pick one of each, in this order</span></h4>
-      ${it.groups.map((g, gi) => groupHTML(g, gi, it.groups.length)).join('') || '<p class="hint">No options: guests pick the piece and add a name.</p>'}
-      <button class="btn out addg" type="button" data-addgroup>+ Add option group</button>
-    </div></details>`;
+  const DRAW = [['bagtag', 'Bag tag'], ['tumbler', 'Tumbler'], ['card', 'Card']];
+  const C = () => cat.categories[sc] || null, P = () => C()?.items[sp] || null, Q = () => P()?.groups[sq] || null;
+  const move = (arr, i, d) => { const j = i + d; if (j < 0 || j >= arr.length) return false; [arr[i], arr[j]] = [arr[j], arr[i]]; return true; };
+  const color = c => c.color || SWATCH[c.id] || '#cccccc';
   const drawFor = it => { const sg = it.groups.find(g => g.swatch), c0 = sg?.choices[0];
     return window.EngravePreview.renderPreview({ item: it.preview || 'card', color: c0?.id, hex: c0?.color, addon: 'none', name: '', font: 'script' }); };
+  const tools = (kind, i, n) => `<span class="ntools"><button type="button" data-up="${kind}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button><button type="button" data-down="${kind}" ${i === n - 1 ? 'disabled' : ''} aria-label="Move down">↓</button><button type="button" data-del="${kind}" aria-label="Delete">×</button></span>`;
+  const photoBtn = (key, label, fallback) => key
+    ? `<button type="button" class="nphoto" data-photo="${esc(key)}" data-plabel="${esc(label)}" aria-label="Photo for ${esc(label)}">${typeof photoLib[key] === 'string' ? `<img src="${esc(photoLib[key])}" alt="">` : (fallback || '<span>+ photo</span>')}</button>`
+    : `<span class="nphoto off" title="Save first to add a photo">${fallback || ''}</span>`;
+  // One branch node: the name is edited in place; tapping the node opens its branch.
+  const node = (kind, i, n, label, on, ph, extra = '', count = '') => `<div class="node ${on ? 'on' : ''}" data-node="${kind}" data-i="${i}">
+      ${ph || ''}<input id="${kind}-${i}" class="nname" data-f="${kind}" value="${esc(label)}" placeholder="Name" aria-label="${kind} name">
+      ${count !== '' ? `<span class="ncount">${count}</span>` : ''}${on ? tools(kind, i, n) : ''}
+    </div>${on && extra ? `<div class="nextra">${extra}</div>` : ''}`;
 
-  function render() {
+  function tree() {
+    const c = C(), it = P(), g = Q();
+    const col1 = cat.categories.map((x, i) => node('cat', i, cat.categories.length, x.label, i === sc, '', '', x.items.length)).join('') + `<button type="button" class="nadd" data-add="cat">+ Category</button>`;
+    const col2 = c ? c.items.map((x, i) => node('piece', i, c.items.length, x.label, i === sp,
+        photoBtn(x._new ? null : x.id, x.label, drawFor(x)),
+        `<div class="two"><div class="field"><label class="lbl" for="pmat">Material</label><input id="pmat" data-f="material" value="${esc(x.material || '')}" placeholder="e.g. crystal"></div>
+          <div class="field"><label class="lbl" for="pdraw">Drawing</label><select id="pdraw" data-f="preview">${DRAW.map(([k, l]) => `<option value="${k}" ${x.preview === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
+          ${cat.categories.length > 1 ? `<div class="field"><label class="lbl" for="pcat">Move to</label><select id="pcat" data-movecat>${cat.categories.map((y, j) => `<option value="${j}" ${j === sc ? 'selected' : ''}>${esc(y.label)}</option>`).join('')}</select></div>` : ''}`,
+        x.groups.length)).join('') + `<button type="button" class="nadd" data-add="piece">+ Piece</button>` : '';
+    const col3 = it ? it.groups.map((x, i) => node('group', i, it.groups.length, x.label, i === sq, '',
+        `<label class="sw-tog"><input type="checkbox" data-swatch ${x.swatch ? 'checked' : ''}> show as colors</label>`, x.choices.length)).join('')
+        + `<button type="button" class="nadd" data-add="group">+ Question</button><div class="node fixed"><span class="nname">Name &amp; lettering</span><span class="ncount">always last</span></div>` : '';
+    const col4 = g ? g.choices.map((x, i) => `<div class="node leaf" data-node="choice" data-i="${i}">
+        ${sq === 0 ? photoBtn(it._new || x._new ? null : `${it.id}_${x.id}`, `${it.label} · ${x.label}`, g.swatch ? `<i class="dot" style="background:${esc(color(x))}"></i>` : '') : (g.swatch ? `<i class="dot" style="background:${esc(color(x))}"></i>` : '')}
+        <input id="choice-${i}" class="nname" data-f="choice" value="${esc(x.label)}" placeholder="Name" aria-label="Choice name">
+        ${g.swatch ? `<input type="color" data-f="color" value="${esc(color(x))}" aria-label="${esc(x.label)} color">` : ''}
+        <span class="ntools"><button type="button" data-up="choice" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button><button type="button" data-down="choice" ${i === g.choices.length - 1 ? 'disabled' : ''} aria-label="Move down">↓</button><button type="button" data-del="choice" aria-label="Delete">×</button></span></div>`).join('')
+        + `<div class="nadd in"><input id="newchoice" data-newchoice placeholder="+ Choice" aria-label="New choice"></div>` : '';
+    const col = (title, body, show) => show ? `<div class="bcol"><div class="bh2">${title}</div>${body}</div>` : '';
+    return `<div class="branch">${col('category', col1, true)}${col(c ? esc(c.label || 'pieces') : '', col2, !!c)}${col(it ? esc(it.label || 'questions') : '', col3, !!it)}${col(g ? esc(g.label || 'choices') : '', col4, !!g)}</div>`;
+  }
+  function guestView() {
+    const c = C(), it = P();
+    const cats = cat.categories.filter(x => x.items.length);
+    return `<div class="phonebox gf"><div class="pb-band"><img class="logo" src="logo.png" alt=""></div><div class="pb-body">
+      ${cats.length > 1 ? `<fieldset><legend>what are we <em>making?</em></legend><div class="seg">${cats.map(x => `<button type="button" aria-checked="${x === c}">${esc(x.label || '…')}</button>`).join('')}</div></fieldset>` : ''}
+      <fieldset><legend>what are we personalizing?</legend><div class="pick">${(c?.items || []).map((x, i) => `<button type="button" class="pcard" aria-checked="${i === sp}"><span class="ph">${typeof photoLib[x.id] === 'string' ? `<img src="${esc(photoLib[x.id])}" alt="">` : drawFor(x)}</span><span class="chip">${esc((x.label || '…').toLowerCase())}</span></button>`).join('')}</div></fieldset>
+      ${it ? `${it.groups.map(g => `<fieldset><legend>choose your <em>${esc((g.label || '…').toLowerCase())}</em></legend><div class="${g.swatch ? 'sw' : 'seg'}">${g.choices.map((x, i) => `<button type="button" aria-checked="${i === 0}">${g.swatch ? `<span class="dot" style="background:${esc(color(x))}"></span>` : ''}${esc(x.label.toLowerCase())}</button>`).join('')}</div></fieldset>`).join('')}
+        <fieldset><legend>whose name goes on it?</legend><div class="pb-name">Name or initials</div></fieldset>` : ''}
+    </div></div>`;
+  }
+  function render(focusId) {
     const y = scrollY;
-    $app.innerHTML = `${staffHead('catalog', 'catalog')}<main class="wrap catalog">
-      <h1>the <em>catalog</em></h1>
-      <p class="hint">Categories hold pieces. Each piece has its own option groups (finish, size, detail…), shown to guests in this order. Every event picks which pieces and choices it offers in <a href="#/admin">Event setup</a>. Photos follow each piece's first two groups.</p>
-      ${cat.categories.map((c, ci) => `<section class="catsec" data-ci="${ci}">
-        <div class="cathdr"><label class="vh">Category name</label><input class="catname" data-f="cat" value="${esc(c.label)}" placeholder="Category name">${tools('cat', ci, cat.categories.length)}</div>
-        ${c.items.map((it, ii) => pieceHTML(it, ci, ii, c.items.length)).join('') || '<p class="hint">No pieces in this category yet.</p>'}
-        <button class="btn out addp" type="button" data-addpiece>+ Add a piece to ${esc(c.label || 'this category')}</button></section>`).join('')}
-      <button class="btn out" type="button" id="addcat" style="width:100%;margin-top:18px">+ Add category</button>
+    $app.innerHTML = `${staffHead('form builder', 'catalog')}<main class="wrap builder">
+      <div class="bhead"><h1>form <em>builder</em></h1><button class="btn out" id="gv" type="button">Guest view</button></div>
+      ${tree()}
     </main>
-    <div class="savebar"><span id="dirty">${dirty ? 'Unsaved changes' : 'All changes saved'}</span><button class="btn" id="save" type="button" ${dirty ? '' : 'disabled'}>Save catalog</button></div>`;
+    <div class="savebar"><span id="dirty">${dirty ? 'Unsaved changes' : 'All changes saved'}</span><button class="btn" id="save" type="button" ${dirty ? '' : 'disabled'}>Save</button></div>`;
     bind(); scrollTo(0, y);
+    if (focusId) { const el = document.getElementById(focusId); if (el) { el.focus(); if (el.setSelectionRange && el.value) el.setSelectionRange(el.value.length, el.value.length); } }
   }
   const markDirty = () => { dirty = true; document.getElementById('dirty').textContent = 'Unsaved changes'; document.getElementById('save').disabled = false; };
-  const change = fn => e => { fn(e); dirty = true; render(); };
+  const change = (fn, focusId) => { fn(); dirty = true; render(focusId); };
+  const select = (kind, i) => {
+    if (kind === 'cat' && sc !== i) { sc = i; sp = 0; sq = 0; return true; }
+    if (kind === 'piece' && sp !== i) { sp = i; sq = 0; return true; }
+    if (kind === 'group' && sq !== i) { sq = i; return true; }
+    return false;
+  };
   function bind() {
     bindStaffHead();
-    document.querySelectorAll('details.pedit').forEach(d => d.ontoggle = () => { const { it } = at(d); d.open ? opened.add(it) : opened.delete(it); });
+    document.querySelectorAll('.node[data-node]').forEach(n => {
+      const kind = n.dataset.node, i = +n.dataset.i;
+      if (kind === 'choice') return;
+      n.addEventListener('click', e => { if (e.target.closest('button,select,label,input[type=color]')) return; if (select(kind, i)) render(e.target.id || null); });
+      n.querySelector('.nname').addEventListener('focus', e => { if (select(kind, i)) render(e.target.id); });
+    });
     document.querySelectorAll('[data-f]').forEach(inp => {
-      const ev = inp.tagName === 'SELECT' ? 'onchange' : 'oninput';
-      inp[ev] = () => {
-        const f = inp.dataset.f, v = inp.value;
-        if (f === 'cat') at(inp).c.label = v;
-        else if (f === 'piece') at(inp).it.label = v;
-        else if (f === 'material') at(inp).it.material = v;
-        else if (f === 'preview') { at(inp).it.preview = v; dirty = true; render(); return; }
-        else if (f === 'group') grp(inp).label = v;
-        else if (f === 'choice') grp(inp).choices[+inp.closest('[data-xi]').dataset.xi].label = v;
-        else if (f === 'color') grp(inp).choices[+inp.closest('[data-xi]').dataset.xi].color = v;
+      inp[inp.tagName === 'SELECT' ? 'onchange' : 'oninput'] = () => {
+        const f = inp.dataset.f, v = inp.value, i = +inp.closest('[data-i]')?.dataset.i;
+        if (f === 'cat') C().label = v;
+        else if (f === 'piece') P().label = v;
+        else if (f === 'material') P().material = v;
+        else if (f === 'preview') { P().preview = v; change(() => {}); return; }
+        else if (f === 'group') Q().label = v;
+        else if (f === 'choice') Q().choices[i].label = v;
+        else if (f === 'color') { Q().choices[i].color = v; const d = inp.closest('.node').querySelector('.dot'); if (d) d.style.background = v; }
         markDirty();
       };
     });
-    document.querySelectorAll('[data-swatch]').forEach(cb => cb.onchange = change(() => { const g = grp(cb); g.swatch = cb.checked; if (g.swatch) g.choices.forEach(c => { c.color = c.color || SWATCH[c.id] || '#cccccc'; }); }));
-    document.querySelectorAll('[data-movecat]').forEach(sel => sel.onchange = change(() => { const { c, it } = at(sel); c.items.splice(c.items.indexOf(it), 1); cat.categories[+sel.value].items.push(it); opened.add(it); }));
-    const addChoice = el => { const box = el.closest('.gedit'), inp = box.querySelector('[data-newchoice]'), label = inp.value.trim(); if (!label) { inp.focus(); return; }
-      const g = grp(el); if (g.choices.some(c => c.label.toLowerCase() === label.toLowerCase())) { toast(`${label} is already there`); return; }
-      g.choices.push({ label, _new: true, ...(g.swatch ? { color: '#cccccc' } : {}) }); dirty = true;
-      const gi = box.dataset.gi, ci = box.closest('[data-ci]').dataset.ci, ii = box.closest('[data-ii]').dataset.ii; render();
-      document.querySelector(`[data-ci="${ci}"][data-ii="${ii}"] [data-gi="${gi}"] [data-newchoice]`)?.focus(); };
-    document.querySelectorAll('[data-addchoice]').forEach(b => b.onclick = () => addChoice(b));
-    document.querySelectorAll('[data-newchoice]').forEach(i => i.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addChoice(i); } });
-    document.querySelectorAll('[data-addgroup]').forEach(b => b.onclick = change(() => { at(b).it.groups.push({ label: '', swatch: false, choices: [], _new: true }); }));
-    document.querySelectorAll('[data-addpiece]').forEach(b => b.onclick = () => { const it = { label: '', material: '', preview: 'card', groups: [], _new: true }; at(b).c.items.push(it); opened.add(it); dirty = true; render(); [...document.querySelectorAll('details.pedit')].find(d => at(d).it === it)?.querySelector('[data-f="piece"]').focus(); });
-    document.getElementById('addcat').onclick = change(() => { cat.categories.push({ label: '', items: [], _new: true }); });
-    const nav = (b, d) => { const kind = b.dataset.up || b.dataset.down; const { c, it } = at(b);
-      if (kind === 'cat') move(cat.categories, cat.categories.indexOf(c), d);
-      else if (kind === 'piece') move(c.items, c.items.indexOf(it), d);
-      else if (kind === 'group') move(it.groups, +b.closest('[data-gi]').dataset.gi, d); };
-    document.querySelectorAll('[data-up]').forEach(b => b.onclick = e => { e.preventDefault(); nav(b, -1); dirty = true; render(); });
-    document.querySelectorAll('[data-down]').forEach(b => b.onclick = e => { e.preventDefault(); nav(b, 1); dirty = true; render(); });
-    document.querySelectorAll('[data-del]').forEach(b => b.onclick = e => {
-      e.preventDefault(); const kind = b.dataset.del, { c, it } = at(b);
-      if (kind === 'cat') { if (c.items.length && !confirm(`Delete ${c.label || 'this category'} and its ${c.items.length} piece(s)? Events that offer them will stop showing them.`)) return; cat.categories.splice(cat.categories.indexOf(c), 1); }
-      else if (kind === 'piece') { if (!it._new && !confirm(`Delete ${it.label}? Events that offer it will stop showing it. Past orders keep their details.`)) return; c.items.splice(c.items.indexOf(it), 1); }
-      else if (kind === 'group') it.groups.splice(+b.closest('[data-gi]').dataset.gi, 1);
-      else if (kind === 'choice') grp(b).choices.splice(+b.closest('[data-xi]').dataset.xi, 1);
-      dirty = true; render();
+    const sw = document.querySelector('[data-swatch]');
+    if (sw) sw.onchange = () => change(() => { const g = Q(); g.swatch = sw.checked; if (g.swatch) g.choices.forEach(x => { x.color = x.color || SWATCH[x.id] || '#cccccc'; }); });
+    const mc = document.querySelector('[data-movecat]');
+    if (mc) mc.onchange = () => change(() => { const it = P(); C().items.splice(sp, 1); sc = +mc.value; cat.categories[sc].items.push(it); sp = cat.categories[sc].items.length - 1; sq = 0; });
+    const nc = document.getElementById('newchoice');
+    if (nc) {
+      const add = () => { const label = nc.value.trim(); if (!label) return; nc.value = '';
+        const g = Q(); if (g.choices.some(x => x.label.toLowerCase() === label.toLowerCase())) { toast(`${label} is already there`); return; }
+        change(() => g.choices.push({ label, _new: true, ...(g.swatch ? { color: '#cccccc' } : {}) }), 'newchoice'); };
+      nc.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); add(); } };
+      nc.onblur = () => { if (nc.value.trim()) add(); };
+    }
+    document.querySelectorAll('[data-add]').forEach(b => b.onclick = () => {
+      const k = b.dataset.add;
+      if (k === 'cat') change(() => { cat.categories.push({ label: '', items: [], _new: true }); sc = cat.categories.length - 1; sp = 0; sq = 0; }, `cat-${cat.categories.length}`);
+      if (k === 'piece') change(() => { C().items.push({ label: '', material: '', preview: 'card', groups: [], _new: true }); sp = C().items.length - 1; sq = 0; }, `piece-${C().items.length}`);
+      if (k === 'group') change(() => { P().groups.push({ label: '', swatch: false, choices: [], _new: true }); sq = P().groups.length - 1; }, `group-${P().groups.length}`);
     });
+    document.querySelectorAll('[data-photo]').forEach(b => b.onclick = e => { e.stopPropagation(); photoSheet(b.dataset.plabel, b.dataset.photo, () => render()); });
+    const nav = (b, d) => { const kind = b.dataset.up || b.dataset.down;
+      if (kind === 'cat') { if (move(cat.categories, sc, d)) sc += d; }
+      else if (kind === 'piece') { if (move(C().items, sp, d)) sp += d; }
+      else if (kind === 'group') { if (move(P().groups, sq, d)) sq += d; }
+      else if (kind === 'choice') move(Q().choices, +b.closest('[data-i]').dataset.i, d); };
+    document.querySelectorAll('[data-up]').forEach(b => b.onclick = e => { e.stopPropagation(); change(() => nav(b, -1)); });
+    document.querySelectorAll('[data-down]').forEach(b => b.onclick = e => { e.stopPropagation(); change(() => nav(b, 1)); });
+    document.querySelectorAll('[data-del]').forEach(b => b.onclick = e => {
+      e.stopPropagation();
+      const kind = b.dataset.del, c = C(), it = P();
+      if (kind === 'cat') { if (c.items.length && !confirm(`Delete ${c.label || 'this category'} and its ${c.items.length} piece(s)? Events that offer them will stop showing them.`)) return; change(() => { cat.categories.splice(sc, 1); sc = Math.max(0, sc - 1); sp = 0; sq = 0; }); }
+      else if (kind === 'piece') { if (!it._new && !confirm(`Delete ${it.label}? Events that offer it will stop showing it. Past orders keep their details.`)) return; change(() => { c.items.splice(sp, 1); sp = Math.max(0, sp - 1); sq = 0; }); }
+      else if (kind === 'group') change(() => { it.groups.splice(sq, 1); sq = Math.max(0, sq - 1); });
+      else if (kind === 'choice') change(() => Q().choices.splice(+b.closest('[data-i]').dataset.i, 1));
+    });
+    document.getElementById('gv').onclick = () => {
+      const d = document.createElement('dialog'); d.className = 'psheet gvsheet';
+      d.innerHTML = `${guestView()}<button class="btn out" type="button" data-x>Close</button>`;
+      document.body.appendChild(d); d.showModal();
+      const close = () => { d.close(); d.remove(); };
+      d.querySelector('[data-x]').onclick = close; d.addEventListener('cancel', e => { e.preventDefault(); close(); });
+    };
     document.getElementById('save').onclick = save;
   }
   // New things get a permanent id from their name when first saved; existing ids never change.
@@ -1107,7 +1269,7 @@ async function catalogPage() {
     const problems = [];
     cat.categories.forEach(c => { if (!c.label.trim()) problems.push('A category needs a name.');
       c.items.forEach(it => { const nm = it.label.trim() || 'A piece'; if (!it.label.trim()) problems.push('A piece needs a name.');
-        it.groups.forEach(g => { if (!g.label.trim()) problems.push(`${nm}: an option group needs a name.`); if (!g.choices.length) problems.push(`${nm}: ${g.label || 'an option group'} needs at least one choice.`);
+        it.groups.forEach(g => { if (!g.label.trim()) problems.push(`${nm}: a question needs a name.`); if (!g.choices.length) problems.push(`${nm}: ${g.label || 'a question'} needs at least one choice.`);
           if (g.choices.some(x => !x.label.trim())) problems.push(`${nm}: a choice under ${g.label} has no name.`); }); }); });
     if (problems.length) { toast(problems[0]); return; }
     const catIds = new Set(cat.categories.filter(c => !c._new).map(c => c.id)), pieceIds = new Set(cat.categories.flatMap(c => c.items).filter(i => !i._new).map(i => i.id));
@@ -1122,10 +1284,11 @@ async function catalogPage() {
       await setDoc(doc(db, 'config', 'catalog'), { categories: clean, updatedAt: serverTimestamp(), by: user.email });
       CAT = { categories: clean }; catLoading = Promise.resolve();
       const added = clean.flatMap(c => c.items).filter(i => !pieceIds.has(i.id));
-      dirty = false; toast(added.length ? `Saved. Turn ${added.map(i => i.label).join(', ')} on in each event's setup to offer it.` : 'Catalog saved');
-      catalogPage();
+      // Swap in the saved form (new things now have ids, so they can take photos) and stay on the same branch.
+      cat.categories = JSON.parse(JSON.stringify(clean)); dirty = false; render();
+      toast(added.length ? `Saved. Turn ${added.map(i => i.label).join(', ')} on in each event's menu.` : 'Saved');
     } catch (err) { toast('Could not save: ' + (err.code || err.message)); b.disabled = false; }
-    finally { saving = false; b.textContent = 'Save catalog'; }
+    finally { saving = false; const s = document.getElementById('save'); if (s) { s.textContent = 'Save'; s.disabled = !dirty; } }
   }
   const leave = e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } };
   addEventListener('beforeunload', leave); unsubs.push(() => removeEventListener('beforeunload', leave));
@@ -1174,7 +1337,7 @@ async function photosPage() {
   function render() {
     const y = scrollY, n = slots.filter(s => typeof photoLib[s.key] === 'string').length;
     $app.innerHTML = `${staffHead('photos', 'photos')}<main class="wrap"><h1>example <em>photos</em></h1>
-      <p class="hint">${n} of ${slots.length} added. Guests see these as they choose; without one they see a drawn preview. Every event uses this library. Shoot in portrait with the piece centered. Pieces and choices come from the <a href="#/catalog">catalog</a>.</p>
+      <p class="hint">${n} of ${slots.length} added. Guests see these as they choose; without one they see a drawn preview. Every event uses this library. Shoot in portrait with the piece centered. Pieces and choices come from the <a href="#/catalog">Form builder</a>.</p>
       ${pieces.map(p => `<h2 class="sec">${esc(p.it.label.toLowerCase())} <small>${esc(p.cat.label)}</small></h2><div class="pgrid">${p.slots.map(tile).join('')}</div>`).join('') || '<p class="note">The catalog has no pieces yet.</p>'}</main>`;
     bindStaffHead(); scrollTo(0, y);
     document.querySelectorAll('[data-upload]').forEach(inp => inp.onchange = async () => {

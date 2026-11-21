@@ -15,6 +15,11 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // The staff PIN, same for every event. Only managers see or change it.
+    match /private/{docId} {
+      allow read, write: if isStaff();
+    }
+
     // Shared catalog (categories, pieces, options): everyone reads it, managers edit it.
     match /config/{docId} {
       allow read: if true;
@@ -42,26 +47,23 @@ service cloud.firestore {
       allow read: if true;
       allow write: if isStaff();
 
-      // The event's staff PIN. Only managers see or change it.
-      match /private/{docId} {
-        allow read, write: if isStaff();
-      }
-
-      // One doc per signed-in staff device. Creating it proves the PIN: the PIN sent must match
-      // the event's, and the name must be one of the event's staff names.
+      // One doc per signed-in staff device. Creating it proves the PIN: the PIN sent must match,
+      // the event must be open, and the name must be one of the event's staff names.
       match /staffSessions/{uid} {
         allow read: if (request.auth != null && request.auth.uid == uid) || isStaff();
         allow create, update: if request.auth != null && request.auth.uid == uid
           && request.resource.data.keys().hasOnly(['name', 'pin', 'at'])
-          && request.resource.data.pin == get(/databases/$(database)/documents/events/$(eventId)/private/access).data.pin
+          && request.resource.data.pin == get(/databases/$(database)/documents/private/access).data.pin
+          && get(/databases/$(database)/documents/events/$(eventId)).data.get('open', true) != false
           && request.resource.data.name in get(/databases/$(database)/documents/events/$(eventId)).data.engravers;
         allow delete: if (request.auth != null && request.auth.uid == uid) || isStaff();
       }
 
-      // Public queue snapshot the board maintains, so guests can see their position.
+      // Public docs: the queue snapshot the board maintains (so guests see their position)
+      // and the event's branding images (managers only).
       match /public/{docId} {
         allow read: if true;
-        allow write: if canWork();
+        allow write: if isStaff() || (docId == 'queue' && canWork());
         // A guest may add only their own new order to the bottom of the line, in the same batch that creates it.
         allow create, update: if docId == 'queue' && request.auth != null
           && request.resource.data.keys().hasOnly(['ids', 'updatedAt'])
