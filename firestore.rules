@@ -47,15 +47,15 @@ service cloud.firestore {
       allow read: if true;
       allow write: if isStaff();
 
-      // One doc per signed-in staff device. Creating it proves the PIN: the PIN sent must match,
-      // the event must be open, and the name must be one of the event's staff names.
+      // One doc per signed-in staff device. Creating it proves the PIN: the PIN sent must match
+      // and the event must be open. A name, if sent, must be one of the event's staff names.
       match /staffSessions/{uid} {
         allow read: if (request.auth != null && request.auth.uid == uid) || isStaff();
         allow create, update: if request.auth != null && request.auth.uid == uid
           && request.resource.data.keys().hasOnly(['name', 'pin', 'at'])
           && request.resource.data.pin == get(/databases/$(database)/documents/private/access).data.pin
           && get(/databases/$(database)/documents/events/$(eventId)).data.get('open', true) != false
-          && request.resource.data.name in get(/databases/$(database)/documents/events/$(eventId)).data.engravers;
+          && (!('name' in request.resource.data) || request.resource.data.name in get(/databases/$(database)/documents/events/$(eventId)).data.engravers);
         allow delete: if (request.auth != null && request.auth.uid == uid) || isStaff();
       }
 

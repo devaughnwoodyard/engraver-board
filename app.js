@@ -136,12 +136,13 @@ async function isStaff() {
 // Event setup, catalog and photos are for the managers (Google accounts listed in /staff).
 async function staffGate(render) {
   if (await isStaff()) return render();
-  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">events</div>${WAVE(390)}</header>
-    <main class="content"><a class="backlink" href="#/staff">‹ Event staff sign in</a><h1>events</h1>
-    <p class="note">${user && !user.isAnonymous ? `Signed in as ${esc(user.email)}, which can't open Events.` : 'Sign in with Google.'}</p>
+  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">event setup</div>${WAVE(390)}</header>
+    <main class="content">${crumbs([['Events', '#/'], ['Event setup', '#/admin'], ['Sign in']])}<h1>event <em>setup</em></h1>
+    <p class="note">${user && !user.isAnonymous ? `${esc(user.email)} can't open event setup.` : "Sign in with Steph's or DeVaughn's Google account."}</p>
     <button class="btn" id="g" type="button">Sign in with Google</button>
     ${user && !user.isAnonymous ? '<button class="btn out" id="out" type="button">Sign out</button>' : ''}
     <p class="note" style="font-size:.8125rem">On an iPad home-screen app, if the sign-in window doesn't open, open this page in Safari once and sign in there.</p></main></div>`;
+
   document.getElementById('g').onclick = async () => {
     try { await signInWithPopup(auth, new GoogleAuthProvider()); route(); }
     catch (e) { toast('Sign-in did not finish: ' + (e.code || e.message)); }
@@ -149,7 +150,7 @@ async function staffGate(render) {
   const out = document.getElementById('out'); if (out) out.onclick = () => signOut(auth).then(route);
 }
 
-// Event staff: the app opens straight onto the event that's open now. Staff tap their name and enter the PIN once.
+// Event staff: tap the event, enter the staff PIN once on this device, then pick your name.
 // One PIN covers every event (managers set it in Event setup). The database rules check it, and only while the event is open.
 const staffKey = id => 'eb-staff-' + id;
 function staffName(id) { try { return localStorage.getItem(staffKey(id)) || ''; } catch (e) { return ''; } }
@@ -183,64 +184,73 @@ async function boardGate(eventId) {
   location.replace(`${baseUrl()}#/staff/${encodeURIComponent(eventId)}`);
 }
 
-async function staffSignIn(eventId) {
+// Breadcrumbs: [[label, href], …, [label]] — the last one is where you are.
+const crumbs = list => `<nav class="crumbs" aria-label="Breadcrumb">${list.map(([l, h], i) => i < list.length - 1 && h ? `<a href="${h}">${esc(l)}</a>` : `<span aria-current="page">${esc(l)}</span>`).join('<i aria-hidden="true">›</i>')}</nav>`;
+
+// Events home → tap an event → staff PIN → pick your name (the event's guest QR shows here) → board.
+async function staffSignIn(eventId, step) {
   $app.innerHTML = `<div class="page"><p class="note" style="padding:40px">Loading…</p></div>`;
   await authReady;
   const mgr = await isStaff();
-  const head = `<header class="band">${LOGO}<div class="ev">event staff</div>${WAVE(390)}</header>`;
-  const foot = `<a class="barlink" href="#/admin">Events</a>`;
-  let ev = null, live = [];
-  if (eventId) { try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? { id: eventId, ...s.data() } : null; } catch (e) {} }
-  else { try { live = openEvents(await listEvents()); ev = live.find(e => staffName(e.id)) || live[0] || null; } catch (e) {} }
-  if (!ev) {
-    $app.innerHTML = `<div class="page">${head}<main class="content"><div class="rule"></div><h1>no event is <em>open</em></h1>
-      <p class="note">When an event opens, it shows up here.</p></main><div class="bar stack">${foot}</div></div>`;
+  const head = `<header class="band">${LOGO}<div class="ev">events</div>${WAVE(390)}</header>`;
+  const setupLink = `<a class="barlink" href="#/admin">Event setup</a>`;
+
+  if (!eventId) {
+    let live = [];
+    try { live = openEvents(await listEvents()); } catch (e) {}
+    $app.innerHTML = `<div class="page">${head}<main class="content">${crumbs([['Events']])}
+      ${live.length ? `<div class="evpick tall">${live.map(e => `<a href="#/staff/${encodeURIComponent(e.id)}"><b>${esc(e.name)}</b><small>${esc(fmtDate(e.date))}</small></a>`).join('')}</div>`
+        : `<div class="rule"></div><h1>no event is <em>open</em></h1>`}
+      </main><div class="bar stack">${setupLink}</div></div>`;
     return;
   }
-  eventId = ev.id;
-  if (ev.open === false && !mgr && eventId !== DEMO_ID) {
-    // Devices already signed in can still finish up on the board.
-    if (await canWorkBoard(eventId)) return boardPage(eventId);
-    $app.innerHTML = `<div class="page">${head}<main class="content"><div class="rule"></div><h1>this event is <em>closed</em></h1>
-      <p class="note">${esc(ev.name)} · ${esc(fmtDate(ev.date))}</p></main><div class="bar stack">${foot}</div></div>`;
+
+  let ev = null;
+  try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
+  if (!ev) { location.replace(`${baseUrl()}#/`); return; }
+  const trail = [['Events', '#/'], [ev.name, `#/staff/${encodeURIComponent(eventId)}`]];
+  const signedIn = mgr || eventId === DEMO_ID || await canWorkBoard(eventId);
+
+  if (ev.open === false && !mgr && !signedIn) {
+    $app.innerHTML = `<div class="page">${head}<main class="content">${crumbs([trail[0], [ev.name]])}<div class="rule"></div><h1>this event is <em>closed</em></h1></main><div class="bar stack">${setupLink}</div></div>`;
     return;
   }
-  let names = ev.engravers || [];
-  const needPin = eventId !== DEMO_ID && !mgr;
-  const pickName = () => names.includes(staffName(eventId)) ? staffName(eventId) : (names.length === 1 ? names[0] : '');
-  const st = { name: pickName(), pin: '', busy: false, err: '' };
-  function render() {
-    $app.innerHTML = `<div class="page">${head}<main class="content">
-      ${live.length > 1 ? `<fieldset><legend>which <em>event?</em></legend><div class="evpick" role="radiogroup" aria-label="Event">${live.map(e => `<button type="button" role="radio" aria-checked="${e.id === eventId}" data-ev="${esc(e.id)}"><b>${esc(e.name)}</b><small>${esc(fmtDate(e.date))}</small></button>`).join('')}</div></fieldset>`
-        : `<div class="evnow"><span class="eyebrow">event staff sign in</span><h1>${esc(ev.name)}</h1><p class="note">${esc(fmtDate(ev.date))}</p></div>`}
-      <fieldset><legend>who are <em>you?</em></legend>
-        <div class="namegrid" role="radiogroup" aria-label="Your name">${names.map(n => `<button type="button" role="radio" aria-checked="${n === st.name}" data-nm="${esc(n)}">${esc(n)}</button>`).join('') || '<p class="note">No staff names on this event yet.</p>'}</div></fieldset>
-      ${needPin ? `<div class="field"><label class="lbl" for="pin" style="text-align:center">Staff PIN</label>
-        <input id="pin" class="pinfield" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="one-time-code" value="${esc(st.pin)}"></div>` : ''}
-      <p class="err" role="alert">${esc(st.err)}</p></main>
-      <div class="bar stack"><button class="btn" id="go" type="button" ${!st.name || st.busy || (needPin && st.pin.length !== 4) ? 'disabled' : ''}>${st.busy ? 'Checking…' : 'Open the board'}</button>${foot}</div></div>`;
-    $app.querySelectorAll('[data-nm]').forEach(b => b.onclick = () => { st.name = b.dataset.nm; st.err = ''; render(); document.getElementById('pin')?.focus(); });
-    $app.querySelectorAll('[data-ev]').forEach(b => b.onclick = () => { ev = live.find(e => e.id === b.dataset.ev); eventId = ev.id; names = ev.engravers || []; st.name = pickName(); st.err = ''; render(); });
-    const p = document.getElementById('pin');
-    if (p) p.oninput = () => { st.pin = p.value.replace(/\D/g, '').slice(0, 4); p.value = st.pin; st.err = ''; document.getElementById('go').disabled = !st.name || st.pin.length !== 4; };
-    document.getElementById('go').onclick = go;
-  }
-  async function go() {
-    st.busy = true; render();
-    try {
-      if (needPin) {
+
+  // Step 1: the PIN (skipped once this device is in, and for Steph and DeVaughn).
+  if (!signedIn) {
+    const st = { pin: '', busy: false, err: '' };
+    const render = () => {
+      $app.innerHTML = `<div class="page">${head}<main class="content">${crumbs([trail[0], [ev.name]])}
+        <div class="evnow"><h1>${esc(ev.name)}</h1><p class="note">${esc(fmtDate(ev.date))}</p></div>
+        <div class="field"><label class="lbl" for="pin" style="text-align:center">Staff PIN</label>
+          <input id="pin" class="pinfield" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="one-time-code" value="${esc(st.pin)}"></div>
+        <p class="err" role="alert">${esc(st.err)}</p></main>
+        <div class="bar stack"><button class="btn" id="go" type="button" ${st.busy || st.pin.length !== 4 ? 'disabled' : ''}>${st.busy ? 'Checking…' : 'Continue'}</button></div></div>`;
+      const p = document.getElementById('pin'); p.focus();
+      p.oninput = () => { st.pin = p.value.replace(/\D/g, '').slice(0, 4); p.value = st.pin; st.err = ''; document.getElementById('go').disabled = st.pin.length !== 4; if (st.pin.length === 4) go(); };
+      document.getElementById('go').onclick = go;
+    };
+    const go = async () => {
+      if (st.busy) return; st.busy = true; render();
+      try {
         await ensureGuest();
-        await setDoc(doc(db, 'events', eventId, 'staffSessions', user.uid), { name: st.name, pin: st.pin, at: serverTimestamp() });
-      } else if (!mgr) await ensureGuest();
-      setStaffName(eventId, st.name);
-      location.hash = `#/board/${encodeURIComponent(eventId)}`;
-    } catch (e) {
-      st.busy = false; st.pin = '';
-      st.err = e.code === 'permission-denied' ? "That PIN doesn't match." : 'Could not sign in: ' + (e.code || e.message);
-      render();
-    }
+        await setDoc(doc(db, 'events', eventId, 'staffSessions', user.uid), { pin: st.pin, at: serverTimestamp() });
+        location.hash = `#/staff/${encodeURIComponent(eventId)}/who`;
+      } catch (e) { st.busy = false; st.pin = ''; st.err = e.code === 'permission-denied' ? "That PIN doesn't match." : 'Could not sign in: ' + (e.code || e.message); render(); }
+    };
+    render();
+    return;
   }
-  render();
+
+  // Step 2: who are you? The guest QR for this event sits right here to show guests.
+  const names = ev.engravers || [];
+  const url = guestUrl(eventId);
+  $app.innerHTML = `<div class="page">${head}<main class="content">${crumbs([...trail, ['Who are you?']])}
+    <fieldset><legend>who are <em>you?</em></legend>
+      <div class="namegrid">${names.map(n => `<button type="button" data-nm="${esc(n)}" ${n === staffName(eventId) ? 'aria-current="true"' : ''}>${esc(n)}</button>`).join('') || '<p class="note">No staff names on this event yet.</p>'}</div></fieldset>
+    <section class="eventqr"><div class="qr" aria-label="QR code guests scan to order">${qrSvg(url)}</div><div><b>Guests scan to order</b><span>${esc(ev.name)}</span></div></section>
+    </main></div>`;
+  $app.querySelectorAll('[data-nm]').forEach(b => b.onclick = () => { setStaffName(eventId, b.dataset.nm); location.hash = `#/board/${encodeURIComponent(eventId)}`; });
 }
 
 // The one guest QR: always opens whichever event is open now.
@@ -275,7 +285,7 @@ async function route() {
   if (view === 'admin') return staffGate(() => a ? setupPage(a) : adminPage());
   if (view === 'photos') return staffGate(photosPage);
   if (view === 'catalog') return staffGate(catalogPage);
-  return staffSignIn(view === 'staff' ? a : undefined);
+  return staffSignIn(view === 'staff' ? a : undefined, view === 'staff' ? b : undefined);
 }
 addEventListener('hashchange', route);
 
@@ -846,9 +856,10 @@ const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${Stri
 const guestUrl = id => `${baseUrl()}#/e/${encodeURIComponent(id)}`;
 const qrSvg = url => { const q = qrcode(0, 'M'); q.addData(url); q.make(); return q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }); };
 function downloadQr(url, name) { const q = qrcode(0, 'M'); q.addData(url); q.make(); const l = document.createElement('a'); l.href = q.createDataURL(12, 4); l.download = `qr-${name}.gif`; l.click(); }
-const STAFF_TABS = [['setup', '#/admin', 'Events'], ['catalog', '#/catalog', 'Form builder'], ['photos', '#/photos', 'Photos']];
-const staffHead = (title, tab) => `<header class="band">${LOGO}<div class="ev">${esc(title)}</div>${WAVE(1180)}</header>
-  <nav class="snav" aria-label="Staff"><a class="tostaff" href="#/staff">‹ Event staff sign in</a>${STAFF_TABS.map(([k, h, l]) => `<a href="${h}" ${k === tab ? 'aria-current="page"' : ''}>${l}</a>`).join('')}<span>${esc(user.email)}</span><a href="#" id="out">Sign out</a></nav>`;
+const STAFF_TABS = [['setup', '#/admin', 'Event list'], ['catalog', '#/catalog', 'Form builder'], ['photos', '#/photos', 'Photos']];
+const staffHead = (title, tab, here) => `<header class="band">${LOGO}<div class="ev">event setup</div>${WAVE(1180)}</header>
+  <div class="shead2">${crumbs([['Events', '#/'], ['Event setup', '#/admin'], ...(tab === 'setup' && !here ? [['Event list']] : [[STAFF_TABS.find(t => t[0] === tab)[2], STAFF_TABS.find(t => t[0] === tab)[1]]]), ...(here ? [[here]] : [])])}
+  <nav class="snav" aria-label="Event setup">${STAFF_TABS.map(([k, h, l]) => `<a href="${h}" ${k === tab ? 'aria-current="page"' : ''}>${l}</a>`).join('')}<span>${esc(user.email)}</span><a href="#" id="out">Sign out</a></nav></div>`;
 function bindStaffHead() { const o = document.getElementById('out'); if (o) o.onclick = e => { e.preventDefault(); signOut(auth).then(() => { location.hash = '#/'; }); }; }
 const staffLoading = msg => `<div class="page"><p class="note" style="padding:40px">${esc(msg)}</p></div>`;
 const dropHidden = h => Object.fromEntries(Object.entries(h || {}).filter(([, v]) => v === true));
@@ -907,8 +918,8 @@ async function adminPage() {
   const past = real.filter(e => (e.date || '') < addDays(today, -1)).sort(byDateDesc);
   const card = ev => `<a class="evcard ${isLive(ev) ? 'islive' : ''}" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} staff</span></div>
     ${isLive(ev) ? '<span class="chip live">Live now</span>' : `<span class="chip ${ev.open === false ? '' : 'on'}">${ev.open === false ? 'Closed' : 'Open'}</span>`}<span class="chev" aria-hidden="true">›</span></a>`;
-  $app.innerHTML = `${staffHead('events', 'setup')}<main class="wrap">
-    <h1>events</h1>
+  $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap">
+    <h1>event <em>list</em></h1>
     <div class="toprow">
       <section class="card"><h2>staff PIN</h2>
         <div class="pinedit"><label class="vh" for="pinin">Staff PIN</label><input id="pinin" class="pinfield" inputmode="numeric" pattern="[0-9]*" maxlength="4" value="${esc(pin)}"><button class="btn" id="pinsave" type="button" disabled>Save</button></div>
@@ -918,8 +929,7 @@ async function adminPage() {
           <div class="shareinfo"><p class="hint" style="margin:0">Print once. ${live.length > 1 ? 'Two events are open, so guests pick theirs.' : live.length ? `Opens <b>${esc(live[0].name)}</b> right now.` : 'Opens whichever event is open.'}</p>
             <button class="btn out" id="dlqr" type="button">Download QR</button><button class="btn out" id="copy" type="button">Copy link</button></div></div></section>
     </div>
-    <h2 class="sec">events</h2>
-    <div class="evlist">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled.</p>'}</div>
+    <div class="evlist" style="margin-top:18px">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled.</p>'}</div>
     <details class="newev card" ${upcoming.length ? '' : 'open'}><summary>+ New event</summary>
       <form id="new">
         <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
@@ -952,7 +962,7 @@ async function setupPage(eventId) {
   $app.innerHTML = staffLoading('Loading event…');
   let ev = null, others = [], brand = {};
   try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
-  if (!ev) { $app.innerHTML = `${staffHead('events', 'setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
+  if (!ev) { $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
   try { others = (await listEvents()).filter(e => e.id !== eventId && e.id !== DEMO_ID).sort(byDateDesc); } catch (e) {}
   try { const b = await getDoc(brandRef(eventId)); brand = b.exists() ? b.data() : {}; } catch (e) {}
   const st = { name: ev.name || '', date: ev.date || '', open: ev.open !== false, ...setupFrom(ev) };
@@ -978,8 +988,7 @@ async function setupPage(eventId) {
 
   function render() {
     const y = scrollY;
-    $app.innerHTML = `${staffHead('events', 'setup')}<main class="wrap setup">
-      <a class="backlink" href="#/admin">‹ All events</a>
+    $app.innerHTML = `${staffHead('event setup', 'setup', savedName)}<main class="wrap setup">
       <div class="evhead"><h1>${esc(savedName)}</h1><span class="chip ${savedOpen ? 'on' : ''}">${savedOpen ? 'Open' : 'Closed'}</span></div>
       ${!savedOpen ? `<section class="card reuse"><button class="btn" id="reuse" type="button">Reuse this event setup</button>
         <form id="reuseform" hidden><p class="hint">Same staff, menu, pickup spot and branding. No orders.</p>
@@ -1082,42 +1091,54 @@ async function setupPage(eventId) {
 }
 
 // ---------- form builder ----------
-// A branching view: category → pieces → questions → choices. Tap a branch to open what follows it; edit right on the branch.
-// Photos (piece, and each choice of a piece's first question) come from the camera, the camera roll, or the photo library.
+// A top-down branching tree: category → piece → question → choice. Tap a row's arrow to open its branch;
+// edit names right on the row. Photos (piece, and each choice of a piece's first question) come from the
+// camera, the camera roll, or the photo library.
 let libCache = null;
+const fmtUpload = d => {
+  if (!d) return '';
+  const p = n => String(n).padStart(2, '0');
+  const tz = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' }).formatToParts(d).find(x => x.type === 'timeZoneName')?.value || '';
+  const h = d.getHours() % 12 || 12;
+  return `${p(d.getMonth() + 1)}/${p(d.getDate())}/${d.getFullYear()} @ ${p(h)}:${p(d.getMinutes())} ${d.getHours() < 12 ? 'AM' : 'PM'} ${tz}`.trim();
+};
 async function photoLibrary() {
-  if (!libCache) libCache = (await getDocs(collection(db, 'photos'))).docs.map(d => ({ key: d.id, data: d.data().data })).filter(p => typeof p.data === 'string');
-  return libCache;
+  if (!libCache) libCache = (await getDocs(collection(db, 'photos'))).docs.map(d => ({ key: d.id, data: d.data().data, at: tsDate(d.data().updatedAt) })).filter(p => typeof p.data === 'string');
+  return libCache.slice().sort((a, b) => (b.at || 0) - (a.at || 0)); // newest first
 }
 function photoSheet(label, key, onDone) {
   const has = typeof photoLib[key] === 'string';
   const d = document.createElement('dialog'); d.className = 'psheet';
-  const main = () => `<h3>photo · <em>${esc(label)}</em></h3>
+  const main = () => `<div class="shead"><h3>photo · <em>${esc(label)}</em></h3><button class="sx" type="button" data-x aria-label="Close">×</button></div>
     <label class="btn">Take photo<input type="file" accept="image/*" capture="environment" data-file hidden></label>
     <label class="btn out">Camera roll<input type="file" accept="image/*" data-file hidden></label>
     <button class="btn out" type="button" data-lib>Photo library</button>
-    ${has ? '<button class="linkbtn danger" type="button" data-rm>Remove photo</button>' : ''}
-    <button class="linkbtn" type="button" data-x>Cancel</button>`;
+    ${has ? '<button class="linkbtn danger" type="button" data-rm>Remove photo</button>' : ''}`;
   d.innerHTML = main(); document.body.appendChild(d); d.showModal();
   const close = () => { d.close(); d.remove(); };
   const put = async data => {
     d.innerHTML = '<p class="note">Saving…</p>';
-    try { await setDoc(doc(db, 'photos', key), { data, updatedAt: serverTimestamp(), by: user.email }); photoLib[key] = data; if (libCache) { libCache = libCache.filter(p => p.key !== key); libCache.push({ key, data }); } toast('Photo saved'); close(); onDone(); }
-    catch (err) { toast('Could not save: ' + (err.code || err.message)); close(); }
+    try {
+      await setDoc(doc(db, 'photos', key), { data, updatedAt: serverTimestamp(), by: user.email }); photoLib[key] = data;
+      if (libCache) { libCache = libCache.filter(p => p.key !== key); libCache.push({ key, data, at: new Date() }); }
+      toast('Photo saved'); close(); onDone();
+    } catch (err) { toast('Could not save: ' + (err.code || err.message)); close(); }
   };
   const bind = () => {
+    d.querySelectorAll('[data-x]').forEach(b => b.onclick = close);
     d.querySelectorAll('[data-file]').forEach(inp => inp.onchange = async () => { const f = inp.files[0]; if (!f) return; try { await put(await fileToJpeg(f)); } catch (e) { toast("That photo couldn't be read."); close(); } });
     const lib = d.querySelector('[data-lib]');
     if (lib) lib.onclick = async () => {
       d.innerHTML = '<p class="note">Loading library…</p>';
       let all = []; try { all = await photoLibrary(); } catch (e) {}
-      d.innerHTML = `<h3>photo <em>library</em></h3><div class="libgrid">${all.map((p, i) => `<button type="button" data-pick="${i}"><img src="${esc(p.data)}" alt=""></button>`).join('') || '<p class="note">No photos yet.</p>'}</div><button class="linkbtn" type="button" data-back>Back</button>`;
+      d.innerHTML = `<div class="shead"><button class="sx back" type="button" data-back aria-label="Back">‹</button><h3>photo <em>library</em></h3><button class="sx" type="button" data-x aria-label="Close">×</button></div>
+        <div class="libgrid">${all.map((p, i) => `<button type="button" data-pick="${i}"><img src="${esc(p.data)}" alt=""><span>${esc(fmtUpload(p.at)) || 'no date'}</span></button>`).join('') || '<p class="note">No photos yet.</p>'}</div>`;
       d.querySelectorAll('[data-pick]').forEach(b => b.onclick = () => put(all[+b.dataset.pick].data));
       d.querySelector('[data-back]').onclick = () => { d.innerHTML = main(); bind(); };
+      d.querySelectorAll('[data-x]').forEach(b => b.onclick = close);
     };
     const rm = d.querySelector('[data-rm]');
     if (rm) rm.onclick = async () => { try { await deleteDoc(doc(db, 'photos', key)); photoLib[key] = null; if (libCache) libCache = libCache.filter(p => p.key !== key); toast('Photo removed'); } catch (err) { toast('Could not remove: ' + (err.code || err.message)); } close(); onDone(); };
-    d.querySelector('[data-x]')?.addEventListener('click', close);
   };
   bind();
   d.addEventListener('cancel', e => { e.preventDefault(); close(); });
@@ -1127,55 +1148,70 @@ async function catalogPage() {
   $app.innerHTML = staffLoading('Loading form…');
   await loadCatalog(true);
   const cat = JSON.parse(JSON.stringify(CAT));
-  // Load the photos the branches show, so nothing redraws while typing.
+  // Load the photos the tree shows, so nothing redraws while typing.
   const keys = cat.categories.flatMap(c => c.items.flatMap(it => [it.id, ...(it.groups[0]?.choices || []).map(x => `${it.id}_${x.id}`)]));
-  await Promise.all(keys.filter(k => !(k in photoLib) || photoLib[k] === undefined).map(k => getDoc(doc(db, 'photos', k)).then(s => { photoLib[k] = s.exists() ? (s.data().data || null) : null; }).catch(() => { photoLib[k] = null; })));
+  await Promise.all(keys.filter(k => photoLib[k] === undefined).map(k => getDoc(doc(db, 'photos', k)).then(s => { photoLib[k] = s.exists() ? (s.data().data || null) : null; }).catch(() => { photoLib[k] = null; })));
   photoRerender = null;
-  let dirty = false, saving = false, sc = 0, sp = 0, sq = 0;
+  if (cat.categories[0]) cat.categories[0]._open = true;
+  let dirty = false, saving = false;
   leaveGuard = () => dirty;
   const DRAW = [['bagtag', 'Bag tag'], ['tumbler', 'Tumbler'], ['card', 'Card']];
-  const C = () => cat.categories[sc] || null, P = () => C()?.items[sp] || null, Q = () => P()?.groups[sq] || null;
-  const move = (arr, i, d) => { const j = i + d; if (j < 0 || j >= arr.length) return false; [arr[i], arr[j]] = [arr[j], arr[i]]; return true; };
   const color = c => c.color || SWATCH[c.id] || '#cccccc';
   const drawFor = it => { const sg = it.groups.find(g => g.swatch), c0 = sg?.choices[0];
     return window.EngravePreview.renderPreview({ item: it.preview || 'card', color: c0?.id, hex: c0?.color, addon: 'none', name: '', font: 'script' }); };
-  const tools = (kind, i, n) => `<span class="ntools"><button type="button" data-up="${kind}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button><button type="button" data-down="${kind}" ${i === n - 1 ? 'disabled' : ''} aria-label="Move down">↓</button><button type="button" data-del="${kind}" aria-label="Delete">×</button></span>`;
+  // path "c.p.q.x" → the list it lives in, its index, and the thing itself
+  const at = path => {
+    const [c, p, q, x] = path.split('.').map(Number);
+    if (x != null) { const arr = cat.categories[c].items[p].groups[q].choices; return { arr, i: x, o: arr[x], piece: cat.categories[c].items[p], q }; }
+    if (q != null) { const arr = cat.categories[c].items[p].groups; return { arr, i: q, o: arr[q], piece: cat.categories[c].items[p] }; }
+    if (p != null) { const arr = cat.categories[c].items; return { arr, i: p, o: arr[p] }; }
+    return { arr: cat.categories, i: c, o: cat.categories[c] };
+  };
+  const tools = (path, i, n) => `<span class="ttools"><button type="button" data-up="${path}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button><button type="button" data-down="${path}" ${i === n - 1 ? 'disabled' : ''} aria-label="Move down">↓</button><button type="button" data-del="${path}" aria-label="Delete">×</button></span>`;
   const photoBtn = (key, label, fallback) => key
-    ? `<button type="button" class="nphoto" data-photo="${esc(key)}" data-plabel="${esc(label)}" aria-label="Photo for ${esc(label)}">${typeof photoLib[key] === 'string' ? `<img src="${esc(photoLib[key])}" alt="">` : (fallback || '<span>+ photo</span>')}</button>`
-    : `<span class="nphoto off" title="Save first to add a photo">${fallback || ''}</span>`;
-  // One branch node: the name is edited in place; tapping the node opens its branch.
-  const node = (kind, i, n, label, on, ph, extra = '', count = '') => `<div class="node ${on ? 'on' : ''}" data-node="${kind}" data-i="${i}">
-      ${ph || ''}<input id="${kind}-${i}" class="nname" data-f="${kind}" value="${esc(label)}" placeholder="Name" aria-label="${kind} name">
-      ${count !== '' ? `<span class="ncount">${count}</span>` : ''}${on ? tools(kind, i, n) : ''}
-    </div>${on && extra ? `<div class="nextra">${extra}</div>` : ''}`;
+    ? `<button type="button" class="tphoto" data-photo="${esc(key)}" data-plabel="${esc(label)}" aria-label="Photo for ${esc(label)}">${typeof photoLib[key] === 'string' ? `<img src="${esc(photoLib[key])}" alt="">` : (fallback || '<span>+ photo</span>')}</button>`
+    : `<span class="tphoto off" title="Save first to add a photo">${fallback || ''}</span>`;
+  const row = (path, i, n, kind, label, { open, canOpen = true, meta = '', lead = '', after = '' } = {}) => `<div class="trow ${kind} ${open ? 'open' : ''}" data-row="${path}">
+      ${canOpen ? `<button type="button" class="tog" data-tog="${path}" aria-expanded="${!!open}" aria-label="${open ? 'Close' : 'Open'} ${esc(label || kind)}">${open ? '▾' : '▸'}</button>` : '<span class="tog none"></span>'}
+      ${lead}<span class="ttag">${kind}</span>
+      <input class="tname" id="n-${path}" data-name="${path}" value="${esc(label)}" placeholder="Name this ${kind}" aria-label="${kind} name">
+      ${meta ? `<span class="tmeta">${meta}</span>` : ''}${after}${tools(path, i, n)}</div>`;
 
   function tree() {
-    const c = C(), it = P(), g = Q();
-    const col1 = cat.categories.map((x, i) => node('cat', i, cat.categories.length, x.label, i === sc, '', '', x.items.length)).join('') + `<button type="button" class="nadd" data-add="cat">+ Category</button>`;
-    const col2 = c ? c.items.map((x, i) => node('piece', i, c.items.length, x.label, i === sp,
-        photoBtn(x._new ? null : x.id, x.label, drawFor(x)),
-        `<div class="two"><div class="field"><label class="lbl" for="pmat">Material</label><input id="pmat" data-f="material" value="${esc(x.material || '')}" placeholder="e.g. crystal"></div>
-          <div class="field"><label class="lbl" for="pdraw">Drawing</label><select id="pdraw" data-f="preview">${DRAW.map(([k, l]) => `<option value="${k}" ${x.preview === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
-          ${cat.categories.length > 1 ? `<div class="field"><label class="lbl" for="pcat">Move to</label><select id="pcat" data-movecat>${cat.categories.map((y, j) => `<option value="${j}" ${j === sc ? 'selected' : ''}>${esc(y.label)}</option>`).join('')}</select></div>` : ''}`,
-        x.groups.length)).join('') + `<button type="button" class="nadd" data-add="piece">+ Piece</button>` : '';
-    const col3 = it ? it.groups.map((x, i) => node('group', i, it.groups.length, x.label, i === sq, '',
-        `<label class="sw-tog"><input type="checkbox" data-swatch ${x.swatch ? 'checked' : ''}> show as colors</label>`, x.choices.length)).join('')
-        + `<button type="button" class="nadd" data-add="group">+ Question</button><div class="node fixed"><span class="nname">Name &amp; lettering</span><span class="ncount">always last</span></div>` : '';
-    const col4 = g ? g.choices.map((x, i) => `<div class="node leaf" data-node="choice" data-i="${i}">
-        ${sq === 0 ? photoBtn(it._new || x._new ? null : `${it.id}_${x.id}`, `${it.label} · ${x.label}`, g.swatch ? `<i class="dot" style="background:${esc(color(x))}"></i>` : '') : (g.swatch ? `<i class="dot" style="background:${esc(color(x))}"></i>` : '')}
-        <input id="choice-${i}" class="nname" data-f="choice" value="${esc(x.label)}" placeholder="Name" aria-label="Choice name">
-        ${g.swatch ? `<input type="color" data-f="color" value="${esc(color(x))}" aria-label="${esc(x.label)} color">` : ''}
-        <span class="ntools"><button type="button" data-up="choice" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button><button type="button" data-down="choice" ${i === g.choices.length - 1 ? 'disabled' : ''} aria-label="Move down">↓</button><button type="button" data-del="choice" aria-label="Delete">×</button></span></div>`).join('')
-        + `<div class="nadd in"><input id="newchoice" data-newchoice placeholder="+ Choice" aria-label="New choice"></div>` : '';
-    const col = (title, body, show) => show ? `<div class="bcol"><div class="bh2">${title}</div>${body}</div>` : '';
-    return `<div class="branch">${col('category', col1, true)}${col(c ? esc(c.label || 'pieces') : '', col2, !!c)}${col(it ? esc(it.label || 'questions') : '', col3, !!it)}${col(g ? esc(g.label || 'choices') : '', col4, !!g)}</div>`;
+    return `<div class="tree">${cat.categories.map((c, ci) => {
+      const cp = `${ci}`;
+      return `${row(cp, ci, cat.categories.length, 'category', c.label, { open: c._open, meta: `${c.items.length} piece${c.items.length === 1 ? '' : 's'}` })}
+      ${c._open ? `<div class="tkids">${c.items.map((it, pi) => {
+        const pp = `${ci}.${pi}`;
+        return `${row(pp, pi, c.items.length, 'piece', it.label, { open: it._open, meta: `${it.groups.length} question${it.groups.length === 1 ? '' : 's'}`, lead: photoBtn(it._new ? null : it.id, it.label, drawFor(it)) })}
+        ${it._open ? `<div class="tkids">
+          <div class="tdetails"><label>Material<input data-f="material" data-at="${pp}" value="${esc(it.material || '')}" placeholder="e.g. crystal"></label>
+            <label>Drawing<select data-f="preview" data-at="${pp}">${DRAW.map(([k, l]) => `<option value="${k}" ${it.preview === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+            ${cat.categories.length > 1 ? `<label>Category<select data-movecat="${pp}">${cat.categories.map((y, j) => `<option value="${j}" ${j === ci ? 'selected' : ''}>${esc(y.label)}</option>`).join('')}</select></label>` : ''}</div>
+          ${it.groups.map((g, gi) => {
+            const gp = `${pp}.${gi}`;
+            return `${row(gp, gi, it.groups.length, 'question', g.label, { open: g._open, meta: `${g.choices.length} choice${g.choices.length === 1 ? '' : 's'}`,
+              after: `<label class="tcolors"><input type="checkbox" data-swatch="${gp}" ${g.swatch ? 'checked' : ''}> colors</label>` })}
+            ${g._open ? `<div class="tkids">${g.choices.map((x, xi) => {
+              const xp = `${gp}.${xi}`, dot = g.swatch ? `<i class="dot" style="background:${esc(color(x))}"></i>` : '';
+              return row(xp, xi, g.choices.length, 'choice', x.label, { canOpen: false,
+                lead: gi === 0 ? photoBtn(it._new || x._new ? null : `${it.id}_${x.id}`, `${it.label} · ${x.label}`, dot) : dot,
+                after: g.swatch ? `<input type="color" data-color="${xp}" value="${esc(color(x))}" aria-label="${esc(x.label)} color">` : '' });
+            }).join('')}<div class="tadd in"><input data-newchoice="${gp}" placeholder="+ choice" aria-label="New choice for ${esc(g.label)}"></div></div>` : ''}`;
+          }).join('')}
+          <button type="button" class="tadd" data-add="question" data-at="${pp}">+ question</button>
+          <div class="trow fixed"><span class="tog none"></span><span class="ttag">last</span><span class="tname">Name &amp; lettering</span></div>
+        </div>` : ''}`;
+      }).join('')}<button type="button" class="tadd" data-add="piece" data-at="${cp}">+ piece</button></div>` : ''}`;
+    }).join('')}<button type="button" class="tadd" data-add="category">+ category</button></div>`;
   }
   function guestView() {
-    const c = C(), it = P();
+    const c = cat.categories.find(x => x._open && x.items.length) || cat.categories.find(x => x.items.length);
+    const it = c?.items.find(x => x._open) || c?.items[0];
     const cats = cat.categories.filter(x => x.items.length);
     return `<div class="phonebox gf"><div class="pb-band"><img class="logo" src="logo.png" alt=""></div><div class="pb-body">
       ${cats.length > 1 ? `<fieldset><legend>what are we <em>making?</em></legend><div class="seg">${cats.map(x => `<button type="button" aria-checked="${x === c}">${esc(x.label || '…')}</button>`).join('')}</div></fieldset>` : ''}
-      <fieldset><legend>what are we personalizing?</legend><div class="pick">${(c?.items || []).map((x, i) => `<button type="button" class="pcard" aria-checked="${i === sp}"><span class="ph">${typeof photoLib[x.id] === 'string' ? `<img src="${esc(photoLib[x.id])}" alt="">` : drawFor(x)}</span><span class="chip">${esc((x.label || '…').toLowerCase())}</span></button>`).join('')}</div></fieldset>
+      <fieldset><legend>what are we personalizing?</legend><div class="pick">${(c?.items || []).map(x => `<button type="button" class="pcard" aria-checked="${x === it}"><span class="ph">${typeof photoLib[x.id] === 'string' ? `<img src="${esc(photoLib[x.id])}" alt="">` : drawFor(x)}</span><span class="chip">${esc((x.label || '…').toLowerCase())}</span></button>`).join('')}</div></fieldset>
       ${it ? `${it.groups.map(g => `<fieldset><legend>choose your <em>${esc((g.label || '…').toLowerCase())}</em></legend><div class="${g.swatch ? 'sw' : 'seg'}">${g.choices.map((x, i) => `<button type="button" aria-checked="${i === 0}">${g.swatch ? `<span class="dot" style="background:${esc(color(x))}"></span>` : ''}${esc(x.label.toLowerCase())}</button>`).join('')}</div></fieldset>`).join('')}
         <fieldset><legend>whose name goes on it?</legend><div class="pb-name">Name or initials</div></fieldset>` : ''}
     </div></div>`;
@@ -1186,76 +1222,50 @@ async function catalogPage() {
       <div class="bhead"><h1>form <em>builder</em></h1><button class="btn out" id="gv" type="button">Guest view</button></div>
       ${tree()}
     </main>
-    <div class="savebar"><span id="dirty">${dirty ? 'Unsaved changes' : 'All changes saved'}</span><button class="btn" id="save" type="button" ${dirty ? '' : 'disabled'}>Save</button></div>`;
+    <div class="savebar"><a class="btn out" href="#/admin">Done</a><span id="dirty">${dirty ? 'Unsaved changes' : 'All changes saved'}</span><button class="btn" id="save" type="button" ${dirty ? '' : 'disabled'}>Save</button></div>`;
     bind(); scrollTo(0, y);
     if (focusId) { const el = document.getElementById(focusId); if (el) { el.focus(); if (el.setSelectionRange && el.value) el.setSelectionRange(el.value.length, el.value.length); } }
   }
   const markDirty = () => { dirty = true; document.getElementById('dirty').textContent = 'Unsaved changes'; document.getElementById('save').disabled = false; };
   const change = (fn, focusId) => { fn(); dirty = true; render(focusId); };
-  const select = (kind, i) => {
-    if (kind === 'cat' && sc !== i) { sc = i; sp = 0; sq = 0; return true; }
-    if (kind === 'piece' && sp !== i) { sp = i; sq = 0; return true; }
-    if (kind === 'group' && sq !== i) { sq = i; return true; }
-    return false;
-  };
   function bind() {
     bindStaffHead();
-    document.querySelectorAll('.node[data-node]').forEach(n => {
-      const kind = n.dataset.node, i = +n.dataset.i;
-      if (kind === 'choice') return;
-      n.addEventListener('click', e => { if (e.target.closest('button,select,label,input[type=color]')) return; if (select(kind, i)) render(e.target.id || null); });
-      n.querySelector('.nname').addEventListener('focus', e => { if (select(kind, i)) render(e.target.id); });
+    document.querySelectorAll('[data-tog]').forEach(b => b.onclick = () => { const { o } = at(b.dataset.tog); o._open = !o._open; render(); });
+    document.querySelectorAll('[data-name]').forEach(inp => inp.oninput = () => { at(inp.dataset.name).o.label = inp.value; markDirty(); });
+    document.querySelectorAll('[data-f]').forEach(inp => inp[inp.tagName === 'SELECT' ? 'onchange' : 'oninput'] = () => {
+      const { o } = at(inp.dataset.at); o[inp.dataset.f] = inp.value;
+      if (inp.dataset.f === 'preview') change(() => {}); else markDirty();
     });
-    document.querySelectorAll('[data-f]').forEach(inp => {
-      inp[inp.tagName === 'SELECT' ? 'onchange' : 'oninput'] = () => {
-        const f = inp.dataset.f, v = inp.value, i = +inp.closest('[data-i]')?.dataset.i;
-        if (f === 'cat') C().label = v;
-        else if (f === 'piece') P().label = v;
-        else if (f === 'material') P().material = v;
-        else if (f === 'preview') { P().preview = v; change(() => {}); return; }
-        else if (f === 'group') Q().label = v;
-        else if (f === 'choice') Q().choices[i].label = v;
-        else if (f === 'color') { Q().choices[i].color = v; const d = inp.closest('.node').querySelector('.dot'); if (d) d.style.background = v; }
-        markDirty();
-      };
-    });
-    const sw = document.querySelector('[data-swatch]');
-    if (sw) sw.onchange = () => change(() => { const g = Q(); g.swatch = sw.checked; if (g.swatch) g.choices.forEach(x => { x.color = x.color || SWATCH[x.id] || '#cccccc'; }); });
-    const mc = document.querySelector('[data-movecat]');
-    if (mc) mc.onchange = () => change(() => { const it = P(); C().items.splice(sp, 1); sc = +mc.value; cat.categories[sc].items.push(it); sp = cat.categories[sc].items.length - 1; sq = 0; });
-    const nc = document.getElementById('newchoice');
-    if (nc) {
+    document.querySelectorAll('[data-color]').forEach(inp => inp.oninput = () => { at(inp.dataset.color).o.color = inp.value; const d = inp.closest('.trow').querySelector('.dot'); if (d) d.style.background = inp.value; markDirty(); });
+    document.querySelectorAll('[data-swatch]').forEach(cb => cb.onchange = () => change(() => { const g = at(cb.dataset.swatch).o; g.swatch = cb.checked; if (g.swatch) g.choices.forEach(x => { x.color = x.color || SWATCH[x.id] || '#cccccc'; }); }));
+    document.querySelectorAll('[data-movecat]').forEach(sel => sel.onchange = () => change(() => { const { arr, i, o } = at(sel.dataset.movecat); arr.splice(i, 1); const to = cat.categories[+sel.value]; to.items.push(o); to._open = true; }));
+    document.querySelectorAll('[data-newchoice]').forEach(nc => {
       const add = () => { const label = nc.value.trim(); if (!label) return; nc.value = '';
-        const g = Q(); if (g.choices.some(x => x.label.toLowerCase() === label.toLowerCase())) { toast(`${label} is already there`); return; }
-        change(() => g.choices.push({ label, _new: true, ...(g.swatch ? { color: '#cccccc' } : {}) }), 'newchoice'); };
+        const g = at(nc.dataset.newchoice).o; if (g.choices.some(x => x.label.toLowerCase() === label.toLowerCase())) { toast(`${label} is already there`); return; }
+        change(() => g.choices.push({ label, _new: true, ...(g.swatch ? { color: '#cccccc' } : {}) }), null);
+        document.querySelector(`[data-newchoice="${nc.dataset.newchoice}"]`)?.focus(); };
       nc.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); add(); } };
       nc.onblur = () => { if (nc.value.trim()) add(); };
-    }
+    });
     document.querySelectorAll('[data-add]').forEach(b => b.onclick = () => {
       const k = b.dataset.add;
-      if (k === 'cat') change(() => { cat.categories.push({ label: '', items: [], _new: true }); sc = cat.categories.length - 1; sp = 0; sq = 0; }, `cat-${cat.categories.length}`);
-      if (k === 'piece') change(() => { C().items.push({ label: '', material: '', preview: 'card', groups: [], _new: true }); sp = C().items.length - 1; sq = 0; }, `piece-${C().items.length}`);
-      if (k === 'group') change(() => { P().groups.push({ label: '', swatch: false, choices: [], _new: true }); sq = P().groups.length - 1; }, `group-${P().groups.length}`);
+      if (k === 'category') change(() => cat.categories.push({ label: '', items: [], _new: true, _open: true }), `n-${cat.categories.length}`);
+      if (k === 'piece') { const c = at(b.dataset.at).o; change(() => c.items.push({ label: '', material: '', preview: 'card', groups: [], _new: true, _open: true }), `n-${b.dataset.at}.${c.items.length}`); }
+      if (k === 'question') { const it = at(b.dataset.at).o; change(() => it.groups.push({ label: '', swatch: false, choices: [], _new: true, _open: true }), `n-${b.dataset.at}.${it.groups.length}`); }
     });
-    document.querySelectorAll('[data-photo]').forEach(b => b.onclick = e => { e.stopPropagation(); photoSheet(b.dataset.plabel, b.dataset.photo, () => render()); });
-    const nav = (b, d) => { const kind = b.dataset.up || b.dataset.down;
-      if (kind === 'cat') { if (move(cat.categories, sc, d)) sc += d; }
-      else if (kind === 'piece') { if (move(C().items, sp, d)) sp += d; }
-      else if (kind === 'group') { if (move(P().groups, sq, d)) sq += d; }
-      else if (kind === 'choice') move(Q().choices, +b.closest('[data-i]').dataset.i, d); };
-    document.querySelectorAll('[data-up]').forEach(b => b.onclick = e => { e.stopPropagation(); change(() => nav(b, -1)); });
-    document.querySelectorAll('[data-down]').forEach(b => b.onclick = e => { e.stopPropagation(); change(() => nav(b, 1)); });
-    document.querySelectorAll('[data-del]').forEach(b => b.onclick = e => {
-      e.stopPropagation();
-      const kind = b.dataset.del, c = C(), it = P();
-      if (kind === 'cat') { if (c.items.length && !confirm(`Delete ${c.label || 'this category'} and its ${c.items.length} piece(s)? Events that offer them will stop showing them.`)) return; change(() => { cat.categories.splice(sc, 1); sc = Math.max(0, sc - 1); sp = 0; sq = 0; }); }
-      else if (kind === 'piece') { if (!it._new && !confirm(`Delete ${it.label}? Events that offer it will stop showing it. Past orders keep their details.`)) return; change(() => { c.items.splice(sp, 1); sp = Math.max(0, sp - 1); sq = 0; }); }
-      else if (kind === 'group') change(() => { it.groups.splice(sq, 1); sq = Math.max(0, sq - 1); });
-      else if (kind === 'choice') change(() => Q().choices.splice(+b.closest('[data-i]').dataset.i, 1));
+    document.querySelectorAll('[data-photo]').forEach(b => b.onclick = () => photoSheet(b.dataset.plabel, b.dataset.photo, () => render()));
+    const mv = (path, d) => { const { arr, i } = at(path); const j = i + d; if (j < 0 || j >= arr.length) return; [arr[i], arr[j]] = [arr[j], arr[i]]; };
+    document.querySelectorAll('[data-up]').forEach(b => b.onclick = () => change(() => mv(b.dataset.up, -1)));
+    document.querySelectorAll('[data-down]').forEach(b => b.onclick = () => change(() => mv(b.dataset.down, 1)));
+    document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
+      const path = b.dataset.del, { arr, i, o } = at(path), depth = path.split('.').length;
+      if (depth === 1 && o.items.length && !confirm(`Delete ${o.label || 'this category'} and its ${o.items.length} piece(s)? Events that offer them will stop showing them.`)) return;
+      if (depth === 2 && !o._new && !confirm(`Delete ${o.label}? Events that offer it will stop showing it. Past orders keep their details.`)) return;
+      change(() => arr.splice(i, 1));
     });
     document.getElementById('gv').onclick = () => {
       const d = document.createElement('dialog'); d.className = 'psheet gvsheet';
-      d.innerHTML = `${guestView()}<button class="btn out" type="button" data-x>Close</button>`;
+      d.innerHTML = `<div class="shead"><h3>guest <em>view</em></h3><button class="sx" type="button" data-x aria-label="Close">×</button></div>${guestView()}`;
       document.body.appendChild(d); d.showModal();
       const close = () => { d.close(); d.remove(); };
       d.querySelector('[data-x]').onclick = close; d.addEventListener('cancel', e => { e.preventDefault(); close(); });
@@ -1264,6 +1274,8 @@ async function catalogPage() {
   }
   // New things get a permanent id from their name when first saved; existing ids never change.
   const uniq = (label, taken, fallback) => { const b = slug(label) || fallback; let id = b; for (let n = 2; taken.has(id); n++) id = `${b}-${n}`; taken.add(id); return id; };
+  // Carry the open/closed state over to the saved copy (same order, same shape).
+  const keepOpen = (from, to) => from.forEach((c, ci) => { to[ci]._open = c._open; c.items.forEach((it, pi) => { to[ci].items[pi]._open = it._open; it.groups.forEach((g, gi) => { to[ci].items[pi].groups[gi]._open = g._open; }); }); });
   async function save() {
     if (saving || !dirty) return;
     const problems = [];
@@ -1284,8 +1296,8 @@ async function catalogPage() {
       await setDoc(doc(db, 'config', 'catalog'), { categories: clean, updatedAt: serverTimestamp(), by: user.email });
       CAT = { categories: clean }; catLoading = Promise.resolve();
       const added = clean.flatMap(c => c.items).filter(i => !pieceIds.has(i.id));
-      // Swap in the saved form (new things now have ids, so they can take photos) and stay on the same branch.
-      cat.categories = JSON.parse(JSON.stringify(clean)); dirty = false; render();
+      const next = JSON.parse(JSON.stringify(clean)); keepOpen(cat.categories, next); cat.categories = next;
+      dirty = false; render();
       toast(added.length ? `Saved. Turn ${added.map(i => i.label).join(', ')} on in each event's menu.` : 'Saved');
     } catch (err) { toast('Could not save: ' + (err.code || err.message)); b.disabled = false; }
     finally { saving = false; const s = document.getElementById('save'); if (s) { s.textContent = 'Save'; s.disabled = !dirty; } }
