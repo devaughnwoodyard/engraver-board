@@ -133,19 +133,101 @@ async function isStaff() {
   if (!user || user.isAnonymous || !user.email) return false;
   try { return (await getDoc(doc(db, 'staff', user.email))).exists(); } catch (e) { return false; }
 }
+// Event setup, catalog and photos are for the managers (Google accounts listed in /staff).
 async function staffGate(render) {
   if (await isStaff()) return render();
-  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">staff</div>${WAVE(390)}</header>
-    <main class="content"><h1>staff <em>sign-in</em></h1>
-    <p class="note">${user && !user.isAnonymous ? `Signed in as ${esc(user.email)}, which isn't on the staff list yet.` : 'Sign in with the Google account on the staff list.'}</p>
+  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">event setup</div>${WAVE(390)}</header>
+    <main class="content"><a class="backlink" href="#/staff">‹ Event staff sign in</a><h1>event <em>setup</em></h1>
+    <p class="note">${user && !user.isAnonymous ? `Signed in as ${esc(user.email)}, which can't open event setup.` : 'Event setup is for Steph and DeVaughn. Sign in with Google.'}</p>
     <button class="btn" id="g" type="button">Sign in with Google</button>
     ${user && !user.isAnonymous ? '<button class="btn out" id="out" type="button">Sign out</button>' : ''}
+    <p class="note" style="font-size:.8125rem">Working an event? Use <a href="#/staff">Event staff sign in</a> instead.</p>
     <p class="note" style="font-size:.8125rem">On an iPad home-screen app, if the sign-in window doesn't open, open this page in Safari once and sign in there.</p></main></div>`;
   document.getElementById('g').onclick = async () => {
     try { await signInWithPopup(auth, new GoogleAuthProvider()); route(); }
     catch (e) { toast('Sign-in did not finish: ' + (e.code || e.message)); }
   };
   const out = document.getElementById('out'); if (out) out.onclick = () => signOut(auth).then(route);
+}
+
+// Event staff: pick the event, pick your name from the list Steph set up, enter the event PIN once.
+// The PIN check happens in the database rules, which then let this device work that event's board.
+const staffKey = id => 'eb-staff-' + id;
+function staffName(id) { try { return localStorage.getItem(staffKey(id)) || ''; } catch (e) { return ''; } }
+function setStaffName(id, n) { try { localStorage.setItem(staffKey(id), n); } catch (e) {} }
+const newPin = () => String(crypto.getRandomValues(new Uint32Array(1))[0] % 10000).padStart(4, '0');
+const ymd = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const addDays = (s, n) => { const d = new Date(s + 'T12:00:00'); d.setDate(d.getDate() + n); return ymd(d); };
+async function canWorkBoard(eventId) {
+  if (eventId === DEMO_ID || await isStaff()) return true;
+  if (!user) return false;
+  try { return (await getDocFromServer(doc(db, 'events', eventId, 'staffSessions', user.uid))).exists(); }
+  catch (e) { try { return (await getDoc(doc(db, 'events', eventId, 'staffSessions', user.uid))).exists(); } catch (x) { return false; } }
+}
+async function boardGate(eventId) {
+  await authReady;
+  if (eventId === DEMO_ID) await ensureGuest();
+  if (await canWorkBoard(eventId)) return boardPage(eventId);
+  location.replace(`${baseUrl()}#/staff/${encodeURIComponent(eventId)}`);
+}
+
+async function staffSignIn(eventId) {
+  $app.innerHTML = `<div class="page"><p class="note" style="padding:40px">Loading…</p></div>`;
+  await authReady;
+  const mgr = await isStaff();
+  const head = `<header class="band">${LOGO}<div class="ev">event staff</div>${WAVE(390)}</header>`;
+  const setupLink = `<a class="btn out" href="#/admin" style="flex:none">Event setup</a><p class="note" style="font-size:.8125rem">Event setup is for Steph and DeVaughn.</p>`;
+  if (!eventId) {
+    let evs = [];
+    try { evs = await listEvents(); } catch (e) {}
+    // Active = yesterday (late-night events) through the next week.
+    const today = todayStr(), from = addDays(today, -1), to = addDays(today, 7);
+    const active = evs.filter(e => e.id !== DEMO_ID && (e.date || '') >= from && (e.date || '') <= to).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const demo = evs.find(e => e.id === DEMO_ID);
+    const card = e => `<a class="evcard" href="#/staff/${encodeURIComponent(e.id)}"><div><b>${esc(e.name)}</b><span>${esc(fmtDate(e.date))} · ${(e.engravers || []).length} staff</span></div><span class="chev" aria-hidden="true">›</span></a>`;
+    $app.innerHTML = `<div class="page">${head}<main class="content"><h1>event staff <em>sign in</em></h1>
+      <p class="note">Pick your event.</p>
+      <div class="evlist">${active.map(card).join('') || '<p class="note">No events right now. Steph adds them in Event setup.</p>'}</div>
+      ${demo ? `<details class="pastev"><summary>Practice</summary><div class="evlist">${card(demo)}</div></details>` : ''}
+      ${setupLink}</main></div>`;
+    return;
+  }
+  let ev = null;
+  try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
+  if (!ev) { $app.innerHTML = `<div class="page">${head}<main class="content"><h1>event not <em>found</em></h1><a class="btn out" href="#/staff">Pick another event</a></main></div>`; return; }
+  const names = ev.engravers || [];
+  const needPin = eventId !== DEMO_ID && !mgr;
+  const st = { name: names.includes(staffName(eventId)) ? staffName(eventId) : (names.length === 1 ? names[0] : ''), pin: '', busy: false, err: '' };
+  function render() {
+    $app.innerHTML = `<div class="page">${head}<main class="content"><a class="backlink" href="#/staff">‹ All events</a>
+      <h1>${esc(ev.name)}</h1><p class="note">${esc(fmtDate(ev.date))}</p>
+      <fieldset><legend>who are <em>you?</em></legend>
+        <div class="namegrid" role="radiogroup" aria-label="Your name">${names.map(n => `<button type="button" role="radio" aria-checked="${n === st.name}" data-nm="${esc(n)}">${esc(n)}</button>`).join('') || '<p class="note">No staff names on this event yet. Steph adds them in Event setup.</p>'}</div></fieldset>
+      ${needPin ? `<div class="field"><label class="lbl" for="pin" style="text-align:center">Event PIN</label>
+        <input id="pin" class="pinfield" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="one-time-code" value="${esc(st.pin)}"><p class="hint" style="text-align:center">Steph has it. You only enter it once on this device.</p></div>` : ''}
+      <p class="err" role="alert">${esc(st.err)}</p></main>
+      <div class="bar"><button class="btn" id="go" type="button" ${!st.name || st.busy || (needPin && st.pin.length !== 4) ? 'disabled' : ''}>${st.busy ? 'Checking…' : 'Open the board'}</button></div></div>`;
+    $app.querySelectorAll('[data-nm]').forEach(b => b.onclick = () => { st.name = b.dataset.nm; st.err = ''; render(); document.getElementById('pin')?.focus(); });
+    const p = document.getElementById('pin');
+    if (p) p.oninput = () => { st.pin = p.value.replace(/\D/g, '').slice(0, 4); p.value = st.pin; st.err = ''; document.getElementById('go').disabled = !st.name || st.pin.length !== 4; };
+    document.getElementById('go').onclick = go;
+  }
+  async function go() {
+    st.busy = true; render();
+    try {
+      if (needPin) {
+        await ensureGuest();
+        await setDoc(doc(db, 'events', eventId, 'staffSessions', user.uid), { name: st.name, pin: st.pin, at: serverTimestamp() });
+      } else if (!mgr) await ensureGuest();
+      setStaffName(eventId, st.name);
+      location.hash = `#/board/${encodeURIComponent(eventId)}`;
+    } catch (e) {
+      st.busy = false; st.pin = '';
+      st.err = e.code === 'permission-denied' ? "That PIN doesn't match. Check with Steph." : 'Could not sign in: ' + (e.code || e.message);
+      render();
+    }
+  }
+  render();
 }
 
 // ---------- router ----------
@@ -160,7 +242,8 @@ async function route() {
   if (view) await loadCatalog();
   if (view === 'e' && a) return guestForm(a);
   if (view === 'o' && a && b) return statusPage(a, b);
-  if (view === 'board' && a) return a === DEMO_ID ? ensureGuest().then(() => boardPage(a)) : staffGate(() => boardPage(a));
+  if (view === 'board' && a) return boardGate(a);
+  if (view === 'staff') return staffSignIn(a);
   if (view === 'admin') return staffGate(() => a ? setupPage(a) : adminPage());
   if (view === 'photos') return staffGate(photosPage);
   if (view === 'catalog') return staffGate(catalogPage);
@@ -169,13 +252,14 @@ async function route() {
 addEventListener('hashchange', route);
 
 function homePage() {
-  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">ivelisse board</div>${WAVE(390)}</header>
+  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">ivelisse orders</div>${WAVE(390)}</header>
     <main class="content"><div class="rule"></div><h1>live <em>personalization</em></h1>
-    <p class="note">Guests reach their event by scanning its QR code. Staff manage events and boards here.</p>
-    <a class="btn" href="#/board/demo">Try the demo board</a>
-    <a class="btn out" href="#/e/demo">Try the guest form</a>
-    <p class="note" style="font-size:.8125rem">The demo has sample orders and no sign-in. Use "reset demo" on the board to start over.</p>
-    <a class="btn out" href="#/admin">Staff: events &amp; boards</a></main></div>`;
+    <p class="note">Guests reach their event by scanning its QR code.</p>
+    <a class="btn" href="#/staff">Event staff sign in</a>
+    <a class="btn out" href="#/admin">Event setup</a>
+    <p class="note" style="font-size:.8125rem">Event setup is for Steph and DeVaughn.</p>
+    <details class="pastev"><summary>Try the demo</summary><div class="btnrow"><a class="btn out" href="#/board/demo">Demo board</a><a class="btn out" href="#/e/demo">Demo guest form</a></div>
+      <p class="note" style="font-size:.8125rem;margin-top:8px">Sample orders, no sign-in. Use "reset demo" on the board to start over.</p></details></main></div>`;
 }
 
 // ---------- guest form ----------
@@ -595,12 +679,14 @@ async function confirmResetDemo(exists) {
 // ---------- board ----------
 async function boardPage(eventId) {
   let ev = null, orders = [], fromCache = false, lastQueueSig = '', dragging = false, openWho = null, pickupQuery = '';
+  const mgr = await isStaff();
+  const me = staffName(eventId);
   const online = () => navigator.onLine && !fromCache;
   unsubs.push(onSnapshot(doc(db, 'events', eventId), s => { ev = s.exists() ? s.data() : null; render(); }));
   unsubs.push(onSnapshot(query(collection(db, 'events', eventId, 'orders'), orderBy('createdAt')), { includeMetadataChanges: true }, s => {
     orders = s.docs.map(d => ({ id: d.id, pending: d.metadata.hasPendingWrites, ...d.data({ serverTimestamps: 'estimate' }) }));
     fromCache = s.metadata.fromCache; render(); syncQueue();
-  }));
+  }, e => { if (e.code === 'permission-denied') location.replace(`${baseUrl()}#/staff/${encodeURIComponent(eventId)}`); }));
   const onl = () => render(); addEventListener('online', onl); addEventListener('offline', onl);
   unsubs.push(() => { removeEventListener('online', onl); removeEventListener('offline', onl); });
   timers.push(setInterval(() => render(), 30000)); // refresh wait ages
@@ -610,46 +696,58 @@ async function boardPage(eventId) {
     if (sig === lastQueueSig) return; lastQueueSig = sig;
     setDoc(doc(db, 'events', eventId, 'public', 'queue'), { ids, updatedAt: serverTimestamp() }).catch(() => {});
   }
-  const engravers = () => (ev?.engravers?.length ? ev.engravers : ['Steph']);
-  const working = e => orders.find(o => o.status === 'progress' && o.engraver === e);
-  const freeEngravers = () => engravers().filter(e => !working(e));
+  const staff = () => (ev?.engravers?.length ? ev.engravers : ['Steph']);
+  // Anyone can hold any number of pieces; oldest started sits at the top of their column.
+  const holding = e => orders.filter(o => o.status === 'progress' && o.engraver === e).sort((a, b) => (tsDate(a.startedAt) || 0) - (tsDate(b.startedAt) || 0));
   const mins = o => { const d = tsDate(o.createdAt) || tsDate(o.clientAt); return d ? Math.max(0, Math.round((Date.now() - d) / 60000)) : 0; };
   const pendChip = o => o.pending ? `<div class="pend">${online() ? 'Saving…' : 'Offline • move pending'}</div>` : '';
 
-  function queueCard(o, free, i) {
+  // Up to 3 staff: one button each (1 = full width, 2 = left and right, 3 = thirds). More than 3: tap to open the list.
+  function assignRow(o) {
+    const names = staff();
+    const btn = e => `<button type="button" class="as ${e === me ? 'me' : ''}" data-start="${o.id}" data-who="${esc(e)}" aria-label="Assign to ${esc(e)}">${names.length === 1 ? 'Assign to ' : ''}${esc(e)}</button>`;
+    if (names.length <= 3) return `<div class="assign n${names.length}">${names.map(btn).join('')}</div>`;
+    return `<div class="assign n1"><button type="button" class="as" data-pick="${o.id}" aria-expanded="${openWho === o.id}">${openWho === o.id ? 'Assign to… ▴' : 'Tap to assign ▾'}</button></div>
+      ${openWho === o.id ? `<div class="assign n2">${names.map(btn).join('')}</div>` : ''}`;
+  }
+  function queueCard(o, i) {
     const m = mins(o);
-    const action = free.length === 0 ? `<button class="go" type="button" disabled>All engravers busy</button>`
-      : free.length === 1 ? `<button class="go" type="button" data-start="${o.id}" data-who="${esc(free[0])}">Start with ${esc(free[0])}</button>`
-      : `<button class="go" type="button" data-pick="${o.id}" aria-expanded="${openWho === o.id}">Start ▾</button>`;
     return `<div class="qc" data-id="${o.id}"><span class="ph">${previewHTML(ev, o)}</span><div class="nm"><span class="pos" aria-label="Position ${i + 1}">${i + 1}</span>${esc(o.name)}</div><div class="ds">#${shortId(o.id)} • ${esc(describe(ev, o, true))} • ${esc((FONTS[o.font] || '').toLowerCase())}${o.phone ? ' • <b class="txt">gets texts</b>' : ''}</div>
-      <div class="ft"><span class="age ${m >= 10 ? 'hot' : ''}">waiting ${m} min</span>${action}</div>
-      ${openWho === o.id ? `<div class="who">${free.map(e => `<button type="button" data-start="${o.id}" data-who="${esc(e)}">${esc(e)}</button>`).join('')}</div>` : ''}${pendChip(o)}</div>`;
+      <div class="ft"><span class="age ${m >= 10 ? 'hot' : ''}">waiting ${m} min</span></div>${assignRow(o)}${pendChip(o)}</div>`;
   }
   function nowCard(o) {
     const st = tsDate(o.startedAt); const m = st ? Math.max(0, Math.round((Date.now() - st) / 60000)) : 0;
     return `<div class="now" data-id="${o.id}"><div class="top"><span class="ph">${previewHTML(ev, o)}</span><div><div class="nm">${esc(o.name)}</div><div class="ds">#${shortId(o.id)} • ${esc(describe(ev, o, true))}<br>${esc((FONTS[o.font] || '').toLowerCase())} • ${m} min in</div></div></div>
-      <button class="rd" type="button" data-ready="${o.id}">Mark ready ✓</button>${pendChip(o)}</div>`;
+      <div class="acts2"><button class="ret" type="button" data-return="${o.id}">Return to queue</button><button class="rd" type="button" data-ready="${o.id}">Mark ready!</button></div>${pendChip(o)}</div>`;
+  }
+  function readyCard(o) {
+    return `<div class="rc" data-id="${o.id}"><span class="ph">${previewHTML(ev, o)}</span><div><div class="nm">${esc(o.name)} <span class="cd">${shortId(o.id)}</span></div><div class="ds">${esc(describe(ev, o))}${o.engraver ? ' • ' + esc(o.engraver) : ''}</div></div>
+      <button class="pk2" type="button" data-picked="${o.id}">Picked up</button>${pendChip(o)}</div>`;
   }
   function render() {
     if (dragging) return;
     if (!ev) { $app.innerHTML = `<div class="page"><p class="note" style="padding:40px">Loading board…</p></div>`; return; }
     const dlgOpen = document.getElementById('pk')?.open; const qv = document.getElementById('find')?.value ?? pickupQuery;
-    const free = freeEngravers();
-    const q = orders.filter(o => o.status === 'queue');
-    const n = { q: q.length, p: orders.filter(o => o.status === 'progress').length, r: orders.filter(o => o.status === 'done').length, x: orders.filter(o => o.status === 'picked').length };
+    const q = orders.filter(o => o.status === 'queue'), ready = orders.filter(o => o.status === 'done');
+    const n = { q: q.length, p: orders.filter(o => o.status === 'progress').length, r: ready.length, x: orders.filter(o => o.status === 'picked').length };
+    // Pieces held by someone no longer on the event still need a home on screen.
+    const names = [...staff(), ...new Set(orders.filter(o => o.status === 'progress' && o.engraver && !staff().includes(o.engraver)).map(o => o.engraver))];
     $app.innerHTML = `<div class="boardpage">
       <header class="bh">${LOGO}<div><div class="t">${esc(ev.name)}</div><div class="sub">${esc(fmtDate(ev.date))}</div></div>
-        <div class="k"><span><b>${n.q}</b>waiting</span><span><b>${n.p}</b>engraving</span><span><b>${n.x}</b>picked up</span>
-          <button class="pu" id="openpk" type="button">${n.r} to pick up ›</button>
+        <div class="k"><span><b>${n.q}</b>waiting</span><span><b>${n.p}</b>in progress</span><span><b>${n.x}</b>picked up</span>
+          <button class="pu" id="openpk" type="button">Find by code ›</button>
           <span class="lv ${online() ? '' : 'off'}"><i aria-hidden="true"></i>${online() ? 'Live' : 'Offline • moves save on this iPad'}</span>
-          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}<a href="#/admin/${encodeURIComponent(eventId)}">event setup</a><a href="#/catalog">catalog</a></div>${WAVE(1180)}</header>
-      <main class="lanes" style="--n:${engravers().length}">
-        <section class="lane" aria-label="Queue"><h2>queue <small>first in line at the top</small></h2>
-          <div class="drop" data-status="queue" data-engraver="">${q.map((o, i) => queueCard(o, free, i)).join('') || '<p class="note">No one waiting.</p>'}</div></section>
-        ${engravers().map(e => { const w = working(e); const made = orders.filter(o => (o.status === 'done' || o.status === 'picked') && o.engraver === e);
-          return `<section class="lane" aria-label="${esc(e)}"><h2>${esc(e.toLowerCase())} <small>${made.length} engraved</small></h2>
-            <div class="drop zone" data-status="progress" data-engraver="${esc(e)}">${w ? nowCard(w) : `<div class="free"><div><b>free</b>tap Start on a queue card<br>or drag one here</div></div>`}</div>
-            <details class="eng"><summary>Engraved (${made.length})</summary><ul>${made.slice().reverse().map(o => `<li>${esc(o.name)} • #${shortId(o.id)} • ${o.status === 'picked' ? 'picked up' : 'waiting for pickup'}</li>`).join('')}</ul></details></section>`; }).join('')}
+          ${me ? `<span class="whoami">You're ${esc(me)} · <a href="#/staff/${encodeURIComponent(eventId)}">switch</a></span>` : `<a href="#/staff/${encodeURIComponent(eventId)}">pick your name</a>`}
+          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}${mgr ? `<a href="#/admin/${encodeURIComponent(eventId)}">event setup</a>` : ''}</div>${WAVE(1180)}</header>
+      <main class="lanes">
+        <section class="lane q" aria-label="Queue"><h2>queue <small>first in line at the top</small></h2>
+          <div class="drop" data-status="queue" data-engraver="">${q.map(queueCard).join('') || '<p class="note">No one waiting.</p>'}</div></section>
+        ${names.map(e => { const h = holding(e); const made = orders.filter(o => (o.status === 'done' || o.status === 'picked') && o.engraver === e);
+          return `<section class="lane staff ${e === me ? 'mine' : ''}" aria-label="${esc(e)}"><h2><span>${esc(e.toLowerCase())}${e === me ? ' <small class="you">you</small>' : ''}</span> <small>${h.length ? h.length + ' on deck' : 'free'}</small></h2>
+            <div class="drop zone" data-status="progress" data-engraver="${esc(e)}">${h.map(nowCard).join('')}<div class="free"><div><b>free</b>tap a name on a queue card<br>or drag one here</div></div></div>
+            <details class="eng"><summary>Made (${made.length})</summary><ul>${made.slice().reverse().map(o => `<li>${esc(o.name)} • #${shortId(o.id)} • ${o.status === 'picked' ? 'picked up' : 'waiting for pickup'}</li>`).join('')}</ul></details></section>`; }).join('')}
+        <section class="lane ready" aria-label="Ready for pickup"><h2>ready <small>${n.r} to pick up</small></h2>
+          <div class="drop" data-status="done" data-engraver="">${ready.map(readyCard).join('') || '<p class="note">Nothing waiting for pickup.</p>'}</div></section>
       </main>
       <dialog class="pickup" id="pk" aria-labelledby="pkt"><div class="pk-in">
         <h2 id="pkt"><span>ready for <em>pickup</em></span><button class="close" id="pkx" type="button" aria-label="Close">×</button></h2>
@@ -661,21 +759,21 @@ async function boardPage(eventId) {
     bindBoard();
     if (dlgOpen) { document.getElementById('pk').showModal(); renderPickup(); const f = document.getElementById('find'); f.focus(); f.setSelectionRange(f.value.length, f.value.length); }
   }
+  const pickedUp = id => { move(id, 'picked'); toast(`${shortId(id)} picked up`, { label: 'Undo', run: () => move(id, 'done', null, true) }); };
   function renderPickup() {
     const v = (document.getElementById('find')?.value || '').trim().toUpperCase(); pickupQuery = v;
     const list = orders.filter(o => o.status === 'done' && (!v || shortId(o.id).startsWith(v) || o.name.toUpperCase().startsWith(v)));
     document.getElementById('pkl').innerHTML = list.map(o => `<div class="pr ${v.length === 4 && shortId(o.id) === v ? 'match' : ''}"><span class="c">${shortId(o.id)}</span><span class="ph">${previewHTML(ev, o)}</span>
       <div><div style="font:800 1.0625rem var(--body)">${esc(o.name)}</div><div style="font-size:.8125rem;color:var(--muted)">${esc(describe(ev, o))}${o.engraver ? ' • by ' + esc(o.engraver) : ''}</div></div>
-      <button class="pk" type="button" data-picked="${o.id}">Picked up</button></div>`).join('') || `<p class="note">${v ? 'No ready piece matches that code.' : 'Nothing waiting for pickup.'}</p>`;
-    document.querySelectorAll('[data-picked]').forEach(b => b.onclick = () => {
-      const id = b.dataset.picked; move(id, 'picked');
-      toast(`${shortId(id)} picked up`, { label: 'Undo', run: () => move(id, 'done', null, true) });
-    });
+      <button class="pk" type="button" data-pickedx="${o.id}">Picked up</button></div>`).join('') || `<p class="note">${v ? 'No ready piece matches that code.' : 'Nothing waiting for pickup.'}</p>`;
+    document.querySelectorAll('[data-pickedx]').forEach(b => b.onclick = () => pickedUp(b.dataset.pickedx));
   }
   function bindBoard() {
     document.querySelectorAll('[data-pick]').forEach(b => b.onclick = () => { openWho = openWho === b.dataset.pick ? null : b.dataset.pick; render(); });
     document.querySelectorAll('[data-start]').forEach(b => b.onclick = () => { openWho = null; move(b.dataset.start, 'progress', b.dataset.who); });
+    document.querySelectorAll('[data-return]').forEach(b => b.onclick = () => move(b.dataset.return, 'queue'));
     document.querySelectorAll('[data-ready]').forEach(b => b.onclick = () => move(b.dataset.ready, 'done'));
+    document.querySelectorAll('[data-picked]').forEach(b => b.onclick = () => pickedUp(b.dataset.picked));
     const rs = document.getElementById('resetdemo'); if (rs) rs.onclick = e => { e.preventDefault(); confirmResetDemo(true); };
     const d = document.getElementById('pk');
     document.getElementById('openpk').onclick = () => { d.showModal(); renderPickup(); document.getElementById('find').focus(); };
@@ -685,22 +783,20 @@ async function boardPage(eventId) {
     // On a phone the cards fill the screen, so a touch has to scroll the page first; dragging needs a longer hold.
     const phone = matchMedia('(max-width:820px)').matches;
     document.querySelectorAll('.drop').forEach(el => new Sortable(el, {
-      group: 'orders', animation: 150, delay: phone ? 350 : 120, delayOnTouchOnly: true, touchStartThreshold: phone ? 8 : 1, ...(phone ? { supportPointer: false } : {}), draggable: '.qc,.now', filter: 'button,.who', preventOnFilter: false,
+      group: 'orders', animation: 150, delay: phone ? 350 : 120, delayOnTouchOnly: true, touchStartThreshold: phone ? 8 : 1, ...(phone ? { supportPointer: false } : {}), draggable: '.qc,.now,.rc', filter: 'button,.assign', preventOnFilter: false,
       onStart: () => { dragging = true; },
-      onMove: evt => !(evt.to.classList.contains('zone') && evt.to.querySelector('.now') && evt.to !== evt.from), // one piece per engraver
       onEnd: evt => {
         dragging = false;
-        const id = evt.item.dataset.id, to = evt.to;
-        if (evt.from !== to) move(id, to.dataset.status, to.dataset.engraver || null); else render();
+        const id = evt.item.dataset.id, from = evt.from, to = evt.to;
+        if (from !== to) move(id, to.dataset.status, to.dataset.engraver || null); else render();
       }
     }));
   }
   function move(id, status, engraver = null, undo = false) {
     const o = orders.find(x => x.id === id); if (!o) return;
-    if (status === 'progress' && working(engraver) && working(engraver).id !== id) { toast(`${engraver} already has a piece in progress.`); render(); return; }
-    const patch = { status, updatedAt: serverTimestamp() };
+    const patch = { status, updatedAt: serverTimestamp(), movedBy: me || user?.email || null };
     if (status === 'queue') { patch.engraver = null; patch.startedAt = null; patch.doneAt = null; patch.pickedAt = null; }
-    if (status === 'progress') { patch.engraver = engraver; patch.startedAt = serverTimestamp(); patch.doneAt = null; patch.pickedAt = null; }
+    if (status === 'progress') { patch.engraver = engraver; if (o.status !== 'progress') patch.startedAt = serverTimestamp(); patch.doneAt = null; patch.pickedAt = null; }
     if (status === 'done') { if (!undo) patch.doneAt = serverTimestamp(); patch.pickedAt = null; }
     if (status === 'picked') patch.pickedAt = serverTimestamp();
     updateDoc(doc(db, 'events', eventId, 'orders', id), patch).catch(e => { toast('That move did not save: ' + (e.code || e.message)); });
@@ -737,7 +833,7 @@ const qrSvg = url => { const q = qrcode(0, 'M'); q.addData(url); q.make(); retur
 function downloadQr(url, name) { const q = qrcode(0, 'M'); q.addData(url); q.make(); const l = document.createElement('a'); l.href = q.createDataURL(12, 4); l.download = `qr-${name}.gif`; l.click(); }
 const STAFF_TABS = [['setup', '#/admin', 'Event setup'], ['catalog', '#/catalog', 'Catalog'], ['photos', '#/photos', 'Photos']];
 const staffHead = (title, tab) => `<header class="band">${LOGO}<div class="ev">${esc(title)}</div>${WAVE(1180)}</header>
-  <nav class="snav" aria-label="Staff">${STAFF_TABS.map(([k, h, l]) => `<a href="${h}" ${k === tab ? 'aria-current="page"' : ''}>${l}</a>`).join('')}<span>${esc(user.email)}</span><a href="#" id="out">Sign out</a></nav>`;
+  <nav class="snav" aria-label="Staff"><a class="tostaff" href="#/staff">‹ Event staff sign in</a>${STAFF_TABS.map(([k, h, l]) => `<a href="${h}" ${k === tab ? 'aria-current="page"' : ''}>${l}</a>`).join('')}<span>${esc(user.email)}</span><a href="#" id="out">Sign out</a></nav>`;
 function bindStaffHead() { const o = document.getElementById('out'); if (o) o.onclick = e => { e.preventDefault(); signOut(auth).then(() => { location.hash = '#/'; }); }; }
 const staffLoading = msg => `<div class="page"><p class="note" style="padding:40px">${esc(msg)}</p></div>`;
 const dropHidden = h => Object.fromEntries(Object.entries(h || {}).filter(([, v]) => v === true));
@@ -758,7 +854,7 @@ async function adminPage() {
   const upcoming = real.filter(e => (e.date || '') >= today).sort((a, b) => -byDateDesc(a, b));
   const past = real.filter(e => (e.date || '') < today).sort(byDateDesc);
   const demo = evs.find(e => e.id === DEMO_ID);
-  const card = ev => `<a class="evcard" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} engravers · ${allPieces().filter(p => offered(ev, p.it.id)).length} pieces</span></div>
+  const card = ev => `<a class="evcard" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} staff · ${allPieces().filter(p => offered(ev, p.it.id)).length} pieces</span></div>
     <span class="chip ${ev.open === false ? '' : 'on'}">${ev.open === false ? 'Closed' : 'Taking orders'}</span><span class="chev" aria-hidden="true">›</span></a>`;
   $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap">
     <h1>event <em>setup</em></h1>
@@ -767,7 +863,7 @@ async function adminPage() {
       <div class="field"><label class="lbl" for="n-date">Date</label><input id="n-date" type="date" required value="${today}"></div>
       <div class="field wide"><label class="lbl" for="n-from">Start from</label><select id="n-from"><option value="">Everything in the catalog</option>
         ${real.slice().sort(byDateDesc).map(e => `<option value="${esc(e.id)}">Copy ${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select>
-        <span class="hint">Copying brings over the engravers, pickup spot, and which pieces and choices are offered.</span></div>
+        <span class="hint">Copying brings over the staff names, pickup spot, and which pieces and choices are offered.</span></div>
       <button class="btn">Create and set up</button></form>
     <h2 class="sec">upcoming</h2><div class="evlist">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled. Create one above.</p>'}</div>
     ${past.length ? `<details class="pastev"><summary>Past events (${past.length})</summary><div class="evlist">${past.map(card).join('')}</div></details>` : ''}
@@ -790,6 +886,7 @@ async function adminPage() {
       for (let n = 2; (await getDoc(doc(db, 'events', id))).exists(); n++) id = `${base}-${n}`;
       const setup = src ? setupFrom(src) : { engravers: ['Steph', 'Veronica', 'Christina', 'DeVaughn'], pickupNote: 'at the engraving table', items: Object.fromEntries(allPieces().map(({ it }) => [it.id, true])), hidden: {} };
       await setDoc(doc(db, 'events', id), { name, date, ...setup, photos: {}, open: true, createdAt: serverTimestamp(), ...(src ? { copiedFrom: src.id } : {}) });
+      await setDoc(doc(db, 'events', id, 'private', 'access'), { pin: newPin(), updatedAt: serverTimestamp() });
       location.hash = `#/admin/${encodeURIComponent(id)}`;
     } catch (err) { btn.disabled = false; toast('Could not create: ' + (err.code || err.message)); }
   };
@@ -801,6 +898,13 @@ async function setupPage(eventId) {
   try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
   if (!ev) { $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
   try { others = (await listEvents()).filter(e => e.id !== eventId && e.id !== DEMO_ID).sort(byDateDesc); } catch (e) {}
+  // Each event has a staff PIN. Events made before PINs existed get one the first time they're opened here.
+  let pin = '';
+  if (eventId !== DEMO_ID) try {
+    const ps = await getDoc(doc(db, 'events', eventId, 'private', 'access'));
+    pin = ps.exists() ? ps.data().pin : '';
+    if (!pin) { pin = newPin(); await setDoc(doc(db, 'events', eventId, 'private', 'access'), { pin, updatedAt: serverTimestamp() }); }
+  } catch (e) {}
   const st = { name: ev.name || '', date: ev.date || '', open: ev.open !== false, ...setupFrom(ev) };
   let savedEngravers = [...st.engravers], dirty = false, saving = false, savedName = st.name;
   const url = guestUrl(eventId);
@@ -822,16 +926,18 @@ async function setupPage(eventId) {
       <a class="backlink" href="#/admin">‹ All events</a>
       <h1>${esc(savedName)}</h1>
       <div class="btnrow"><a class="btn" href="#/board/${encodeURIComponent(eventId)}">Open board</a><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Preview guest form</a></div>
-      ${others.length ? `<section class="card"><h2>copy from another event</h2><p class="hint">Brings over engravers, pickup spot, and pieces and choices. Name, date, and orders stay as they are. Nothing saves until you tap Save.</p>
+      ${others.length ? `<section class="card"><h2>copy from another event</h2><p class="hint">Brings over staff names, pickup spot, and pieces and choices. Name, date, and orders stay as they are. Nothing saves until you tap Save.</p>
         <div class="addrow"><label class="vh" for="cp-from">Event to copy</label><select id="cp-from">${others.map(e => `<option value="${esc(e.id)}">${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select><button class="btn out" id="cp" type="button">Copy</button></div></section>` : ''}
       <section class="card"><h2>details</h2>
         <div class="field"><label class="lbl" for="s-name">Event name</label><input id="s-name" value="${esc(st.name)}"></div>
         <div class="field"><label class="lbl" for="s-date">Date</label><input id="s-date" type="date" value="${esc(st.date)}"></div>
         <div class="field"><label class="lbl" for="s-pick">Where guests pick up (finishes "pick it up …")</label><input id="s-pick" value="${esc(st.pickupNote)}"></div>
         <label class="tog"><input type="checkbox" id="s-open" ${st.open ? 'checked' : ''}> Taking orders <small>Turn off to close the guest form. Pieces already ordered still show on the board.</small></label></section>
-      <section class="card"><h2>engravers</h2><p class="hint">Each engraver gets a lane on the board.</p>
+      <section class="card"><h2>event staff</h2><p class="hint">Staff pick one of these names at Event staff sign in. Each name gets a column on the board, and up to 3 names show as assign buttons on every queue card.</p>
         <div class="chips" id="chips">${chipsHTML()}</div>
-        <div class="addrow"><label class="vh" for="s-eng">Add an engraver</label><input id="s-eng" placeholder="Name" autocapitalize="words"><button class="btn out" id="addeng" type="button">Add</button></div></section>
+        <div class="addrow"><label class="vh" for="s-eng">Add a staff name</label><input id="s-eng" placeholder="First name" autocapitalize="words"><button class="btn out" id="addeng" type="button">Add</button></div>
+        ${eventId === DEMO_ID ? '<p class="hint" style="margin-top:12px">The demo needs no PIN.</p>' : `<div class="pinrow"><div><div class="lbl">Staff PIN</div><div class="pinshow">${esc(pin || '····')}</div></div><button class="btn out" id="newpin" type="button">New PIN</button></div>
+        <p class="hint">Staff enter it once per device. A new PIN doesn't sign out anyone already in.</p>`}</section>
       <section class="card"><h2>pieces &amp; choices</h2><p class="hint">Check the pieces this event offers, then tap any choice to switch it off here only. To add pieces or choices, edit the <a href="#/catalog">catalog</a>.</p>
         ${CAT.categories.filter(c => c.items.length).map(c => `<h3 class="cathead">${esc(c.label)}</h3>${c.items.map(pieceRow).join('')}`).join('') || '<p class="note">The catalog is empty.</p>'}</section>
       <section class="card"><h2>guest link &amp; QR</h2>
@@ -865,6 +971,8 @@ async function setupPage(eventId) {
     if (cp) cp.onclick = () => { const src = others.find(e => e.id === document.getElementById('cp-from').value); if (!src) return; Object.assign(st, setupFrom(src)); dirty = true; render(); toast(`Copied setup from ${src.name}. Review it, then Save.`); };
     document.getElementById('copy').onclick = () => (navigator.clipboard?.writeText(url) || Promise.reject()).then(() => toast('Guest link copied')).catch(() => toast(url));
     document.getElementById('dlqr').onclick = () => downloadQr(url, eventId);
+    const np = document.getElementById('newpin');
+    if (np) np.onclick = async () => { const p = newPin(); try { await setDoc(doc(db, 'events', eventId, 'private', 'access'), { pin: p, updatedAt: serverTimestamp() }); pin = p; document.querySelector('.pinshow').textContent = p; toast('New staff PIN: ' + p); } catch (err) { toast('Could not change the PIN: ' + (err.code || err.message)); } };
     document.getElementById('export').onclick = async () => { try { await exportOrders(eventId, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); } };
     const cl = document.getElementById('clearlegacy');
     if (cl) cl.onclick = async () => { try { await updateDoc(doc(db, 'events', eventId), { photos: {} }); ev.photos = {}; toast('Old photo links removed'); render(); } catch (err) { toast('Could not remove: ' + (err.code || err.message)); } };
@@ -873,7 +981,7 @@ async function setupPage(eventId) {
   async function save() {
     if (saving || !dirty) return;
     if (!st.name.trim() || !st.date) { toast('The event needs a name and a date.'); return; }
-    if (!st.engravers.length) { toast('Add at least one engraver.'); return; }
+    if (!st.engravers.length) { toast('Add at least one staff name.'); return; }
     const on = allPieces().filter(({ it }) => st.items[it.id]);
     if (!on.length) { toast('Offer at least one piece.'); return; }
     const empty = on.flatMap(({ it }) => it.groups.filter(g => !g.choices.some(c => !st.hidden[`${it.id}/${g.id}/${c.id}`])).map(g => `${it.label}: ${g.label}`));

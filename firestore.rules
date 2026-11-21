@@ -2,7 +2,7 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Staff = signed in with Google, verified email, and listed in /staff/{email}.
+    // Managers (event setup) = signed in with Google, verified email, and listed in /staff/{email}.
     // /staff docs are managed in the Firebase console only.
     function isStaff() {
       return request.auth != null
@@ -15,7 +15,7 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // Shared catalog (categories, pieces, options): everyone reads it, staff edit it.
+    // Shared catalog (categories, pieces, options): everyone reads it, managers edit it.
     match /config/{docId} {
       allow read: if true;
       allow write: if isStaff();
@@ -28,18 +28,40 @@ service cloud.firestore {
       allow delete: if isStaff();
     }
 
-    // Event setup (items, options, engravers): public read so the guest form can render.
+    // Event setup (items, options, staff names): public read so the guest form and staff sign-in can render.
     match /events/{eventId} {
-      // The practice event: anyone with the link can work its board and reset its orders, no staff sign-in.
+      // The practice event: anyone with the link can work its board and reset its orders, no sign-in.
       function isDemo() { return eventId == 'demo' && request.auth != null; }
+      // Event staff: this device signed in to this event with its PIN (see staffSessions below).
+      function isEventStaff() {
+        return request.auth != null
+          && exists(/databases/$(database)/documents/events/$(eventId)/staffSessions/$(request.auth.uid));
+      }
+      function canWork() { return isStaff() || isDemo() || isEventStaff(); }
 
       allow read: if true;
       allow write: if isStaff();
 
+      // The event's staff PIN. Only managers see or change it.
+      match /private/{docId} {
+        allow read, write: if isStaff();
+      }
+
+      // One doc per signed-in staff device. Creating it proves the PIN: the PIN sent must match
+      // the event's, and the name must be one of the event's staff names.
+      match /staffSessions/{uid} {
+        allow read: if (request.auth != null && request.auth.uid == uid) || isStaff();
+        allow create, update: if request.auth != null && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['name', 'pin', 'at'])
+          && request.resource.data.pin == get(/databases/$(database)/documents/events/$(eventId)/private/access).data.pin
+          && request.resource.data.name in get(/databases/$(database)/documents/events/$(eventId)).data.engravers;
+        allow delete: if (request.auth != null && request.auth.uid == uid) || isStaff();
+      }
+
       // Public queue snapshot the board maintains, so guests can see their position.
       match /public/{docId} {
         allow read: if true;
-        allow write: if isStaff() || isDemo();
+        allow write: if canWork();
         // A guest may add only their own new order to the bottom of the line, in the same batch that creates it.
         allow create, update: if docId == 'queue' && request.auth != null
           && request.resource.data.keys().hasOnly(['ids', 'updatedAt'])
@@ -56,11 +78,12 @@ service cloud.firestore {
           && request.resource.data.engraver == null
           && request.resource.data.name is string
           && request.resource.data.name.size() <= 40;
-        // Guests read only their own order; staff read everything.
-        allow read: if isStaff() || isDemo()
+        // Guests read only their own order; staff read everything at their event.
+        allow read: if canWork()
           || (request.auth != null && resource.data.uid == request.auth.uid);
-        // Only staff move or remove cards.
-        allow update, delete: if isStaff() || isDemo();
+        // Staff move cards; only managers (and the demo) delete them.
+        allow update: if canWork();
+        allow delete: if isStaff() || isDemo();
       }
     }
   }
