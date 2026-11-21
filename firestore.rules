@@ -2,44 +2,73 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Staff = signed in with Google, verified email, and listed in /staff/{email}.
-    // /staff docs are managed in the Firebase console only.
-    function isStaff() {
+    // Event managers: these two Google accounts set up events, the catalog and photos.
+    // The same list is MANAGERS in app.js; change both together.
+    function isManager() {
       return request.auth != null
         && request.auth.token.email_verified == true
-        && exists(/databases/$(database)/documents/staff/$(request.auth.token.email));
+        && request.auth.token.email.lower() in ['devaughnwoodyard@gmail.com', 'hello@stephivelisse.com'];
+    }
+    function eventDoc(eventId) { return get(/databases/$(database)/documents/events/$(eventId)).data; }
+    function unlocked(eventId) { return eventDoc(eventId).get('managersOnly', false) != true; }
+    // Event staff: joined this event with its current staff code, and the event isn't locked to managers.
+    // Replacing the code (deleting the old /staffcodes doc) signs everyone out who used it.
+    function isCrew(eventId) {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/events/$(eventId)/crew/$(request.auth.uid))
+        && get(/databases/$(database)/documents/staffcodes/$(get(/databases/$(database)/documents/events/$(eventId)/crew/$(request.auth.uid)).data.code)).data.eventId == eventId
+        && unlocked(eventId);
     }
 
-    match /staff/{email} {
-      allow read: if request.auth != null && request.auth.token.email == email;
-      allow write: if false;
-    }
-
-    // Shared catalog (categories, pieces, options): everyone reads it, staff edit it.
+    // Shared catalog (categories, pieces, options): everyone reads it, managers edit it.
     match /config/{docId} {
       allow read: if true;
-      allow write: if isStaff();
+      allow write: if isManager();
     }
 
     // Example photo library (small JPEGs stored inline), shown to guests at every event.
     match /photos/{key} {
       allow read: if true;
-      allow create, update: if isStaff() && request.resource.data.data is string && request.resource.data.data.size() < 900000;
-      allow delete: if isStaff();
+      allow create, update: if isManager() && request.resource.data.data is string && request.resource.data.data.size() < 900000;
+      allow delete: if isManager();
+    }
+
+    // Staff codes: knowing a code is what lets you look it up. No one can list them.
+    match /staffcodes/{code} {
+      allow get: if true;
+      allow list: if false;
+      allow write: if isManager();
     }
 
     // Event setup (items, options, engravers): public read so the guest form can render.
     match /events/{eventId} {
-      // The practice event: anyone with the link can work its board and reset its orders, no staff sign-in.
+      // The practice event: anyone with the link can work its board and reset its orders, no sign-in.
       function isDemo() { return eventId == 'demo' && request.auth != null; }
+      function canWork() { return isManager() || isDemo() || isCrew(eventId); }
 
       allow read: if true;
-      allow write: if isStaff();
+      allow write: if isManager();
+
+      // The event's staff code. Managers only; the event doc itself is public.
+      match /private/{docId} {
+        allow read, write: if isManager();
+      }
+
+      // One doc per device that joined with the staff code.
+      match /crew/{uid} {
+        allow read: if isManager() || (request.auth != null && request.auth.uid == uid);
+        allow create, update: if request.auth != null && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['code', 'joinedAt'])
+          && request.resource.data.code is string
+          && get(/databases/$(database)/documents/staffcodes/$(request.resource.data.code)).data.eventId == eventId
+          && unlocked(eventId);
+        allow delete: if isManager() || (request.auth != null && request.auth.uid == uid);
+      }
 
       // Public queue snapshot the board maintains, so guests can see their position.
       match /public/{docId} {
         allow read: if true;
-        allow write: if isStaff() || isDemo();
+        allow write: if canWork();
         // A guest may add only their own new order to the bottom of the line, in the same batch that creates it.
         allow create, update: if docId == 'queue' && request.auth != null
           && request.resource.data.keys().hasOnly(['ids', 'updatedAt'])
@@ -56,11 +85,11 @@ service cloud.firestore {
           && request.resource.data.engraver == null
           && request.resource.data.name is string
           && request.resource.data.name.size() <= 40;
-        // Guests read only their own order; staff read everything.
-        allow read: if isStaff() || isDemo()
+        // Guests read only their own order; managers and event staff read everything.
+        allow read: if canWork()
           || (request.auth != null && resource.data.uid == request.auth.uid);
-        // Only staff move or remove cards.
-        allow update, delete: if isStaff() || isDemo();
+        // Only managers and event staff move or remove cards.
+        allow update, delete: if canWork();
       }
     }
   }

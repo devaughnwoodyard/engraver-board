@@ -90,10 +90,7 @@ let photoTimer = null;
 function requestPhoto(key) {
   if (key in photoLib) return;
   photoLib[key] = undefined;
-  getDoc(doc(db, 'photos', key)).then(s => {
-    photoLib[key] = s.exists() ? (s.data().data || null) : null;
-    if (photoLib[key]) { clearTimeout(photoTimer); photoTimer = setTimeout(() => photoRerender && photoRerender(), 60); }
-  }).catch(() => { photoLib[key] = null; });
+  fetchPhoto(key).then(() => { if (photoLib[key]) { clearTimeout(photoTimer); photoTimer = setTimeout(() => photoRerender && photoRerender(), 60); } });
 }
 function photoKeys(o) {
   const p = pieceDef(o.item), op = optsOf(o);
@@ -128,24 +125,91 @@ function rememberOrder(eventId, o) { try { const a = myOrders(eventId).filter(x 
 let user = null;
 const authReady = new Promise(res => { let first = true; onAuthStateChanged(auth, u => { user = u; if (first) { first = false; res(); } }); });
 async function ensureGuest() { await authReady; if (!user) { const c = await signInAnonymously(auth); user = c.user; } return user; }
-async function isStaff() {
-  await authReady;
-  if (!user || user.isAnonymous || !user.email) return false;
-  try { return (await getDoc(doc(db, 'staff', user.email))).exists(); } catch (e) { return false; }
+// Two kinds of staff:
+// - Event managers sign in with Google. Only these accounts set up events, the catalog and photos.
+//   The same list is in firestore.rules; change both together.
+// - Event staff tap "Event staff" and type the event's staff code. No Google account. They get that
+//   event's board only, and lose it when a manager makes a new code or locks the board to managers.
+const MANAGERS = ['devaughnwoodyard@gmail.com', 'hello@stephivelisse.com'];
+const isManager = () => !!user && !user.isAnonymous && MANAGERS.includes(String(user.email || '').toLowerCase());
+async function managerCheck() { await authReady; return isManager(); }
+const CODE_CH = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O, 1/I/L
+const makeCode = () => Array.from(crypto.getRandomValues(new Uint32Array(6)), n => CODE_CH[n % CODE_CH.length]).join('');
+const cleanCode = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+// Makes (or replaces) an event's staff code. Deleting the old code signs out everyone who used it.
+async function setStaffCode(eventId, oldCode) {
+  let code; do { code = makeCode(); } while ((await getDoc(doc(db, 'staffcodes', code))).exists());
+  const b = writeBatch(db);
+  b.set(doc(db, 'staffcodes', code), { eventId, createdAt: serverTimestamp() });
+  if (oldCode) b.delete(doc(db, 'staffcodes', oldCode));
+  b.set(doc(db, 'events', eventId, 'private', 'staff'), { code, updatedAt: serverTimestamp() });
+  await b.commit();
+  return code;
 }
-async function staffGate(render) {
-  if (await isStaff()) return render();
-  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">staff</div>${WAVE(390)}</header>
-    <main class="content"><h1>staff <em>sign-in</em></h1>
-    <p class="note">${user && !user.isAnonymous ? `Signed in as ${esc(user.email)}, which isn't on the staff list yet.` : 'Sign in with the Google account on the staff list.'}</p>
+const CREW_KEY = 'io-crew';
+const crewEvents = () => { try { return JSON.parse(localStorage.getItem(CREW_KEY) || '[]'); } catch (e) { return []; } };
+const rememberCrew = id => { try { localStorage.setItem(CREW_KEY, JSON.stringify([id, ...crewEvents().filter(x => x !== id)].slice(0, 5))); } catch (e) {} };
+async function joinAsCrew(raw) {
+  const code = cleanCode(raw);
+  if (code.length !== 6) throw new Error('Staff codes are 6 letters and numbers.');
+  await ensureGuest();
+  const s = await getDoc(doc(db, 'staffcodes', code)).catch(() => null);
+  if (!s || !s.exists()) throw new Error("That code doesn't match an event. Check it with Steph or DeVaughn.");
+  const eventId = s.data().eventId;
+  const ev = (await getDoc(doc(db, 'events', eventId))).data();
+  if (!ev) throw new Error("That code's event no longer exists.");
+  if (ev.managersOnly) throw new Error(`${ev.name} is locked to event managers right now.`);
+  await setDoc(doc(db, 'events', eventId, 'crew', user.uid), { code, joinedAt: serverTimestamp() });
+  rememberCrew(eventId);
+  return eventId;
+}
+async function isCrew(eventId) {
+  await authReady; if (!user) return false;
+  try { return (await getDoc(doc(db, 'events', eventId, 'crew', user.uid))).exists(); } catch (e) { return false; }
+}
+function googleSignIn() {
+  return signInWithPopup(auth, new GoogleAuthProvider()).then(route).catch(e => toast('Sign-in did not finish: ' + (e.code || e.message)));
+}
+// Setup, catalog and photos: event managers only.
+async function managerGate(render) {
+  if (await managerCheck()) return render();
+  const other = user && !user.isAnonymous;
+  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">event managers</div>${WAVE(390)}</header>
+    <main class="content"><h1>manager <em>sign-in</em></h1>
+    <p class="note">${other ? `${esc(user.email)} isn't an event manager. Sign out and use Steph's or DeVaughn's Google account.` : 'Event setup, the catalog and photos are for event managers.'}</p>
     <button class="btn" id="g" type="button">Sign in with Google</button>
-    ${user && !user.isAnonymous ? '<button class="btn out" id="out" type="button">Sign out</button>' : ''}
+    ${other ? '<button class="btn out" id="out" type="button">Sign out</button>' : ''}
+    <a class="btn out" href="#/staff">I'm event staff</a>
     <p class="note" style="font-size:.8125rem">On an iPad home-screen app, if the sign-in window doesn't open, open this page in Safari once and sign in there.</p></main></div>`;
-  document.getElementById('g').onclick = async () => {
-    try { await signInWithPopup(auth, new GoogleAuthProvider()); route(); }
-    catch (e) { toast('Sign-in did not finish: ' + (e.code || e.message)); }
-  };
+  document.getElementById('g').onclick = googleSignIn;
   const out = document.getElementById('out'); if (out) out.onclick = () => signOut(auth).then(route);
+}
+// The board: managers, or event staff who joined with this event's code.
+async function boardGate(eventId) {
+  if (eventId === DEMO_ID) { await ensureGuest(); return boardPage(eventId); }
+  if (await managerCheck()) return boardPage(eventId);
+  if (await isCrew(eventId)) return boardPage(eventId);
+  return staffCodePage(eventId);
+}
+async function staffCodePage(eventId, msg) {
+  let ev = null;
+  if (eventId) ev = (await getDoc(doc(db, 'events', eventId)).catch(() => null))?.data() || null;
+  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">${esc(ev?.name || 'event staff')}</div>${WAVE(390)}</header>
+    <main class="content"><h1>event <em>staff</em></h1>
+    <p class="note">${msg ? esc(msg) : `Type the 6-character staff code${ev ? ` for ${esc(ev.name)}` : ''}. Steph or DeVaughn has it on the event's setup page.`}</p>
+    <form id="cf" class="codeform"><label class="vh" for="code">Staff code</label>
+      <input class="find codein" id="code" autocapitalize="characters" autocomplete="off" spellcheck="false" maxlength="7" inputmode="text" placeholder="ABC234">
+      <p class="err" id="cerr" role="alert"></p>
+      <button class="btn">Open the board</button></form>
+    <button class="linkbtn" id="mgr" type="button">Event manager? Sign in with Google</button></main></div>`;
+  const inp = document.getElementById('code'); inp.focus();
+  inp.oninput = () => { inp.value = cleanCode(inp.value); document.getElementById('cerr').textContent = ''; };
+  document.getElementById('mgr').onclick = () => { location.hash = '#/admin'; };
+  document.getElementById('cf').onsubmit = async e => {
+    e.preventDefault(); const b = e.target.querySelector('.btn'); b.disabled = true; b.textContent = 'Checking…';
+    try { const id = await joinAsCrew(inp.value); location.hash = `#/board/${encodeURIComponent(id)}`; if (id === eventId) route(); }
+    catch (err) { document.getElementById('cerr').textContent = err.code === 'permission-denied' ? "That code didn't work. It may have been replaced." : err.message; b.disabled = false; b.textContent = 'Open the board'; }
+  };
 }
 
 // ---------- router ----------
@@ -160,22 +224,31 @@ async function route() {
   if (view) await loadCatalog();
   if (view === 'e' && a) return guestForm(a);
   if (view === 'o' && a && b) return statusPage(a, b);
-  if (view === 'board' && a) return a === DEMO_ID ? ensureGuest().then(() => boardPage(a)) : staffGate(() => boardPage(a));
-  if (view === 'admin') return staffGate(() => a ? setupPage(a) : adminPage());
-  if (view === 'photos') return staffGate(photosPage);
-  if (view === 'catalog') return staffGate(catalogPage);
+  if (view === 'board' && a) return boardGate(a);
+  if (view === 'staff') return staffCodePage(a);
+  if (view === 'admin') return managerGate(() => a ? setupPage(a) : adminPage());
+  if (view === 'photos') return managerGate(photosPage);
+  if (view === 'catalog') return managerGate(catalogPage);
   return homePage();
 }
 addEventListener('hashchange', route);
 
-function homePage() {
-  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">ivelisse board</div>${WAVE(390)}</header>
+async function homePage() {
+  await authReady;
+  const mgr = isManager();
+  // Event staff who already joined an event on this device get a one-tap way back to its board.
+  const back = [];
+  for (const id of crewEvents()) { const ev = (await getDoc(doc(db, 'events', id)).catch(() => null))?.data(); if (ev && (ev.date || '') >= todayStr()) back.push({ id, ev }); }
+  $app.innerHTML = `<div class="page"><header class="band">${LOGO}<div class="ev">ivelisse orders</div>${WAVE(390)}</header>
     <main class="content"><div class="rule"></div><h1>live <em>personalization</em></h1>
-    <p class="note">Guests reach their event by scanning its QR code. Staff manage events and boards here.</p>
-    <a class="btn" href="#/board/demo">Try the demo board</a>
+    <p class="note">Guests reach their event by scanning its QR code.</p>
+    ${back.map(b => `<a class="btn" href="#/board/${encodeURIComponent(b.id)}">Back to ${esc(b.ev.name)} board</a>`).join('')}
+    <a class="btn ${back.length ? 'out' : ''}" href="#/staff">Event staff</a>
+    <a class="btn out" href="#/admin">${mgr ? 'Event setup' : 'Event managers'}</a>
+    <div class="rule"></div>
+    <a class="btn out" href="#/board/demo">Try the demo board</a>
     <a class="btn out" href="#/e/demo">Try the guest form</a>
-    <p class="note" style="font-size:.8125rem">The demo has sample orders and no sign-in. Use "reset demo" on the board to start over.</p>
-    <a class="btn out" href="#/admin">Staff: events &amp; boards</a></main></div>`;
+    <p class="note" style="font-size:.8125rem">The demo has sample orders and no sign-in. Use "reset demo" on the board to start over.</p></main></div>`;
 }
 
 // ---------- guest form ----------
@@ -569,7 +642,7 @@ async function resetDemo() {
   const old = await getDoc(evRef).catch(() => null);
   const prev = old && old.exists() ? old.data() : null;
   const today = new Date(); const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-  if (await isStaff()) await setDoc(evRef, { name: 'Demo event', date, engravers: DEMO_ENGRAVERS, items: { bagtag: true, tumbler: true }, hidden: prev?.hidden || {},
+  if (isManager()) await setDoc(evRef, { name: 'Demo event', date, engravers: DEMO_ENGRAVERS, items: { bagtag: true, tumbler: true }, hidden: prev?.hidden || {},
     photos: prev?.photos || {}, pickupNote: prev?.pickupNote || 'at the engraving table', open: true, demo: true, createdAt: prev?.createdAt || serverTimestamp() });
   // Clear every order in the demo event.
   const snap = await getDocs(collection(db, 'events', DEMO_ID, 'orders'));
@@ -592,15 +665,28 @@ async function confirmResetDemo(exists) {
   catch (e) { toast('Demo reset failed: ' + (e.code || e.message)); return false; }
 }
 
+async function setManagersOnly(eventId, on) {
+  try { await updateDoc(doc(db, 'events', eventId), { managersOnly: on, updatedAt: serverTimestamp() }); toast(on ? 'Locked: only event managers can open this board' : 'Unlocked: event staff with the code can open the board'); return true; }
+  catch (e) { toast('Could not change the lock: ' + (e.code || e.message)); return false; }
+}
+
 // ---------- board ----------
 async function boardPage(eventId) {
   let ev = null, orders = [], fromCache = false, lastQueueSig = '', dragging = false, openWho = null, pickupQuery = '';
   const online = () => navigator.onLine && !fromCache;
-  unsubs.push(onSnapshot(doc(db, 'events', eventId), s => { ev = s.exists() ? s.data() : null; render(); }));
+  const mgr = isManager(), demo = eventId === DEMO_ID;
+  let shut = false;
+  // Event staff lose the board when a manager locks it or replaces the staff code.
+  const lockedOut = why => { if (shut) return; shut = true; cleanup(); staffCodePage(eventId, why); };
+  unsubs.push(onSnapshot(doc(db, 'events', eventId), s => {
+    ev = s.exists() ? s.data() : null;
+    if (ev?.managersOnly && !mgr && !demo) return lockedOut(`${ev.name} is locked to event managers right now. Ask Steph or DeVaughn to unlock it.`);
+    render();
+  }));
   unsubs.push(onSnapshot(query(collection(db, 'events', eventId, 'orders'), orderBy('createdAt')), { includeMetadataChanges: true }, s => {
     orders = s.docs.map(d => ({ id: d.id, pending: d.metadata.hasPendingWrites, ...d.data({ serverTimestamps: 'estimate' }) }));
     fromCache = s.metadata.fromCache; render(); syncQueue();
-  }));
+  }, err => { if (err.code === 'permission-denied' && !mgr) lockedOut(ev?.managersOnly ? 'This board is locked to event managers right now.' : 'Your staff code no longer works for this event. Ask for the new one.'); }));
   const onl = () => render(); addEventListener('online', onl); addEventListener('offline', onl);
   unsubs.push(() => { removeEventListener('online', onl); removeEventListener('offline', onl); });
   timers.push(setInterval(() => render(), 30000)); // refresh wait ages
@@ -642,7 +728,8 @@ async function boardPage(eventId) {
         <div class="k"><span><b>${n.q}</b>waiting</span><span><b>${n.p}</b>engraving</span><span><b>${n.x}</b>picked up</span>
           <button class="pu" id="openpk" type="button">${n.r} to pick up ›</button>
           <span class="lv ${online() ? '' : 'off'}"><i aria-hidden="true"></i>${online() ? 'Live' : 'Offline • moves save on this iPad'}</span>
-          ${eventId === DEMO_ID ? '<a href="#" id="resetdemo">reset demo</a>' : ''}<a href="#/admin/${encodeURIComponent(eventId)}">event setup</a><a href="#/catalog">catalog</a></div>${WAVE(1180)}</header>
+          ${demo ? '<a href="#" id="resetdemo">reset demo</a>' : ''}${mgr && !demo ? `<button class="lockb ${ev.managersOnly ? 'on' : ''}" id="lock" type="button" aria-pressed="${!!ev.managersOnly}" title="${ev.managersOnly ? 'Tap to let event staff back on this board' : 'Tap to close this board to everyone but event managers'}">${ev.managersOnly ? 'Managers only' : 'Open to staff'}</button>` : ''}${mgr ? `<a href="#/admin/${encodeURIComponent(eventId)}">event setup</a>` : `<a href="#/">exit</a>`}</div>${WAVE(1180)}</header>
+      ${mgr && ev.managersOnly && !demo ? '<p class="lockbar">Locked to event managers. Event staff can\'t open this board. Tap <b>Managers only</b> to let them back on.</p>' : ''}
       <main class="lanes" style="--n:${engravers().length}">
         <section class="lane" aria-label="Queue"><h2>queue <small>first in line at the top</small></h2>
           <div class="drop" data-status="queue" data-engraver="">${q.map((o, i) => queueCard(o, free, i)).join('') || '<p class="note">No one waiting.</p>'}</div></section>
@@ -677,6 +764,7 @@ async function boardPage(eventId) {
     document.querySelectorAll('[data-start]').forEach(b => b.onclick = () => { openWho = null; move(b.dataset.start, 'progress', b.dataset.who); });
     document.querySelectorAll('[data-ready]').forEach(b => b.onclick = () => move(b.dataset.ready, 'done'));
     const rs = document.getElementById('resetdemo'); if (rs) rs.onclick = e => { e.preventDefault(); confirmResetDemo(true); };
+    const lk = document.getElementById('lock'); if (lk) lk.onclick = () => setManagersOnly(eventId, !ev.managersOnly);
     const d = document.getElementById('pk');
     document.getElementById('openpk').onclick = () => { d.showModal(); renderPickup(); document.getElementById('find').focus(); };
     document.getElementById('pkx').onclick = () => { d.close(); document.getElementById('openpk').focus(); };
@@ -747,6 +835,49 @@ const byDateDesc = (a, b) => String(b.date || '').localeCompare(String(a.date ||
 // The parts of an event's setup that carry over to the next one.
 const setupFrom = src => ({ engravers: [...(src.engravers || [])], pickupNote: src.pickupNote || 'at the engraving table',
   items: Object.fromEntries(allPieces().map(({ it }) => [it.id, offered(src, it.id)])), hidden: dropHidden(src.hidden) });
+const evSummary = ev => { const n = allPieces().filter(p => offered(ev, p.it.id)).length, e = (ev.engravers || []).length;
+  return `${n} piece${n === 1 ? '' : 's'} · ${e} engraver${e === 1 ? '' : 's'}`; };
+const evThumb = ev => { const p = allPieces().find(p => offered(ev, p.it.id)); return p ? previewHTML(ev, { item: p.it.id, opts: firstOpts(ev, p.it) }, false) : ''; };
+const uniqId = (label, taken, fallback) => { const b = slug(label) || fallback; let id = b; for (let n = 2; taken.has(id); n++) id = `${b}-${n}`; taken.add(id); return id; };
+
+// A sheet that slides over the page. Resolves with what was picked, or null when closed.
+// events: list to pick a template from (null skips picking). details: also ask for the new event's name and date.
+function eventSheet({ title, events, details }) {
+  return new Promise(res => {
+    const d = document.createElement('dialog'); d.className = 'sheet';
+    let src = null, done = false;
+    const finish = v => { if (done) return; done = true; res(v); d.close(); d.remove(); };
+    const draw = () => {
+      const picking = events && !src;
+      d.innerHTML = `<div class="sh-in"><h2><span>${picking ? title : 'new <em>event</em>'}</span><button class="close" type="button" data-x aria-label="Close">×</button></h2>
+        ${picking ? `<p class="hint">Pick the event to reuse. It copies the engravers, pickup spot, and which pieces and choices are offered. Photos are shared by every event, so they come along.</p>
+          <div class="evlist">${events.map(e => `<button type="button" class="evcard tplc" data-id="${esc(e.id)}"><span class="tth">${evThumb(e)}</span><div><b>${esc(e.name)}</b><span>${esc(fmtDate(e.date))} · ${evSummary(e)}</span></div><span class="chev" aria-hidden="true">›</span></button>`).join('')
+            || '<p class="note">There are no events to reuse yet. Start one from scratch, and it shows up here next time.</p>'}</div>`
+        : `${src ? `<div class="from"><span class="tth">${evThumb(src)}</span><div><small>Reusing</small><b>${esc(src.name)}</b><span>${evSummary(src)}</span></div><button class="linkbtn" type="button" data-back>Change</button></div>`
+            : '<p class="hint">Starts with every piece in the catalog turned on. You can switch pieces off on the next screen.</p>'}
+          <form id="sf"><div class="field"><label class="lbl" for="sf-name">Event name</label><input id="sf-name" required placeholder="Coach · NorthPark"></div>
+            <div class="field"><label class="lbl" for="sf-date">Date</label><input id="sf-date" type="date" required value="${todayStr()}"></div>
+            <button class="btn">Create event</button></form>`}</div>`;
+      d.querySelector('[data-x]').onclick = () => finish(null);
+      d.querySelectorAll('[data-id]').forEach(b => b.onclick = () => { src = events.find(e => e.id === b.dataset.id); if (!details) finish({ src }); else { draw(); d.querySelector('#sf-name').focus(); } });
+      const bk = d.querySelector('[data-back]'); if (bk) bk.onclick = () => { src = null; draw(); };
+      const f = d.querySelector('#sf');
+      if (f) f.onsubmit = e => { e.preventDefault(); const name = d.querySelector('#sf-name').value.trim(), date = d.querySelector('#sf-date').value; if (name && date) finish({ src, name, date }); };
+    };
+    d.addEventListener('cancel', e => { e.preventDefault(); finish(null); });
+    document.body.appendChild(d); draw(); d.showModal();
+    if (!events) d.querySelector('#sf-name').focus();
+  });
+}
+async function createEvent({ src, name, date }) {
+  // Never overwrite an existing event that happens to share the name and date.
+  const base = slug(`${name}-${date}`) || 'event'; let id = base;
+  for (let n = 2; (await getDoc(doc(db, 'events', id))).exists(); n++) id = `${base}-${n}`;
+  const setup = src ? setupFrom(src) : { engravers: ['Steph', 'Veronica', 'Christina', 'DeVaughn'], pickupNote: 'at the engraving table', items: Object.fromEntries(allPieces().map(({ it }) => [it.id, true])), hidden: {} };
+  await setDoc(doc(db, 'events', id), { name, date, ...setup, photos: {}, open: true, createdAt: serverTimestamp(), ...(src ? { copiedFrom: src.id } : {}) });
+  try { await setStaffCode(id); } catch (e) { /* the setup page offers to make one */ }
+  return id;
+}
 
 async function adminPage() {
   $app.innerHTML = staffLoading('Loading events…');
@@ -758,18 +889,15 @@ async function adminPage() {
   const upcoming = real.filter(e => (e.date || '') >= today).sort((a, b) => -byDateDesc(a, b));
   const past = real.filter(e => (e.date || '') < today).sort(byDateDesc);
   const demo = evs.find(e => e.id === DEMO_ID);
-  const card = ev => `<a class="evcard" href="#/admin/${encodeURIComponent(ev.id)}"><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${(ev.engravers || []).length} engravers · ${allPieces().filter(p => offered(ev, p.it.id)).length} pieces</span></div>
-    <span class="chip ${ev.open === false ? '' : 'on'}">${ev.open === false ? 'Closed' : 'Taking orders'}</span><span class="chev" aria-hidden="true">›</span></a>`;
+  const card = ev => `<a class="evcard" href="#/admin/${encodeURIComponent(ev.id)}"><span class="tth">${evThumb(ev)}</span><div><b>${esc(ev.name)}</b><span>${esc(fmtDate(ev.date))} · ${evSummary(ev)}</span></div>
+    ${ev.managersOnly ? '<span class="chip lk">Managers only</span>' : ''}<span class="chip ${ev.open === false ? '' : 'on'}">${ev.open === false ? 'Closed' : 'Taking orders'}</span><span class="chev" aria-hidden="true">›</span></a>`;
   $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap">
-    <h1>event <em>setup</em></h1>
-    <form id="new" class="card newev"><h2>new event</h2>
-      <div class="field"><label class="lbl" for="n-name">Event name</label><input id="n-name" required placeholder="Coach · NorthPark"></div>
-      <div class="field"><label class="lbl" for="n-date">Date</label><input id="n-date" type="date" required value="${today}"></div>
-      <div class="field wide"><label class="lbl" for="n-from">Start from</label><select id="n-from"><option value="">Everything in the catalog</option>
-        ${real.slice().sort(byDateDesc).map(e => `<option value="${esc(e.id)}">Copy ${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select>
-        <span class="hint">Copying brings over the engravers, pickup spot, and which pieces and choices are offered.</span></div>
-      <button class="btn">Create and set up</button></form>
-    <h2 class="sec">upcoming</h2><div class="evlist">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled. Create one above.</p>'}</div>
+    <h1>your <em>events</em></h1>
+    <div class="bigacts">
+      <button class="bigbtn main" id="tpl" type="button"><span class="bi" aria-hidden="true">⧉</span><span><b>Reuse an event template</b><small>Copy a past event's pieces, choices, engravers and pickup spot</small></span></button>
+      <button class="bigbtn" id="blank" type="button"><span class="bi" aria-hidden="true">+</span><span><b>Start from scratch</b><small>Every catalog piece turned on</small></span></button>
+    </div>
+    <h2 class="sec">upcoming</h2><div class="evlist">${upcoming.map(card).join('') || '<p class="note" style="text-align:left">Nothing scheduled yet.</p>'}</div>
     ${past.length ? `<details class="pastev"><summary>Past events (${past.length})</summary><div class="evlist">${past.map(card).join('')}</div></details>` : ''}
     <h2 class="sec">practice</h2>
     ${demo ? `<div class="evlist">${card(demo)}</div><button class="linkbtn" id="rsdemo" type="button">Reset demo orders</button>`
@@ -778,62 +906,189 @@ async function adminPage() {
   bindStaffHead();
   const mk = document.getElementById('mkdemo'); if (mk) mk.onclick = async () => { mk.disabled = true; if (await confirmResetDemo(false)) adminPage(); else mk.disabled = false; };
   const rs = document.getElementById('rsdemo'); if (rs) rs.onclick = () => confirmResetDemo(true);
-  document.getElementById('new').onsubmit = async e => {
-    e.preventDefault();
-    const name = document.getElementById('n-name').value.trim(), date = document.getElementById('n-date').value;
-    if (!name || !date) return;
-    const src = evs.find(x => x.id === document.getElementById('n-from').value);
-    const btn = e.target.querySelector('.btn'); btn.disabled = true;
-    try {
-      // Never overwrite an existing event that happens to share the name and date.
-      const base = slug(`${name}-${date}`) || 'event'; let id = base;
-      for (let n = 2; (await getDoc(doc(db, 'events', id))).exists(); n++) id = `${base}-${n}`;
-      const setup = src ? setupFrom(src) : { engravers: ['Steph', 'Veronica', 'Christina', 'DeVaughn'], pickupNote: 'at the engraving table', items: Object.fromEntries(allPieces().map(({ it }) => [it.id, true])), hidden: {} };
-      await setDoc(doc(db, 'events', id), { name, date, ...setup, photos: {}, open: true, createdAt: serverTimestamp(), ...(src ? { copiedFrom: src.id } : {}) });
-      location.hash = `#/admin/${encodeURIComponent(id)}`;
-    } catch (err) { btn.disabled = false; toast('Could not create: ' + (err.code || err.message)); }
+  const start = async opts => {
+    const r = await eventSheet(opts); if (!r) return;
+    $app.innerHTML = staffLoading('Creating event…');
+    try { const id = await createEvent(r); location.hash = `#/admin/${encodeURIComponent(id)}`; }
+    catch (err) { toast('Could not create: ' + (err.code || err.message)); adminPage(); }
   };
+  document.getElementById('tpl').onclick = () => start({ title: 'reuse an event <em>template</em>', events: real.slice().sort(byDateDesc), details: true });
+  document.getElementById('blank').onclick = () => start({ events: null, details: true });
+}
+
+// ---------- photos for a piece ----------
+// Photos are shared by every event. Upload one first, then say which choices it shows; the app works out the slot.
+let photoPend = null;              // { item, data, sel } — a picked photo waiting to be tagged
+const photoBusy = new Set();
+const photoFetch = {};
+function fetchPhoto(key) {
+  if (!photoFetch[key]) photoFetch[key] = getDoc(doc(db, 'photos', key)).then(s => { photoLib[key] = s.exists() ? (s.data().data || null) : null; }).catch(() => { photoLib[key] = null; });
+  return photoFetch[key];
+}
+// Loads the photo slots of these pieces, then redraws once.
+function loadPhotos(items, rerender) {
+  const keys = items.flatMap(it => photoSlots(it).map(s => s.key)).filter(k => photoLib[k] === undefined);
+  if (keys.length) Promise.all(keys.map(fetchPhoto)).then(() => rerender && rerender());
+}
+const photoCount = it => photoSlots(it).filter(s => typeof photoLib[s.key] === 'string').length;
+function pendKey(it) {
+  const [g1, g2] = it.groups, sel = photoPend?.sel || {};
+  if (!g1) return it.id;
+  if (!sel[g1.id]) return null;
+  return g2 && sel[g2.id] ? `${it.id}_${sel[g1.id]}_${sel[g2.id]}` : `${it.id}_${sel[g1.id]}`;
+}
+function photoPanelHTML(it) {
+  const slots = photoSlots(it), [g1, g2] = it.groups;
+  const loading = slots.some(s => photoLib[s.key] === undefined);
+  const have = slots.filter(s => typeof photoLib[s.key] === 'string'), missing = slots.filter(s => photoLib[s.key] === null);
+  let tagger = '';
+  if (photoPend && photoPend.item === it.id) {
+    const sel = photoPend.sel, key = pendKey(it), slot = slots.find(s => s.key === key);
+    const row = (g, opts) => `<div class="tg"><span class="gl">${esc(g.label)}</span><div class="cchips">${opts.map(o => `<button type="button" class="tc" data-tag="${esc(g.id)}" data-val="${esc(o.id)}" aria-pressed="${(sel[g.id] || '') === o.id}">${g.swatch && o.color ? `<i style="background:${esc(o.color)}"></i>` : ''}${esc(o.label)}</button>`).join('')}</div></div>`;
+    const g2opts = g2 ? [{ id: '', label: g2.choices.find(c => c.id === 'none')?.label || `Any ${g2.label.toLowerCase()}` }, ...g2.choices.filter(c => c.id !== 'none')] : [];
+    tagger = `<div class="tagger" id="tagger"><img src="${esc(photoPend.data)}" alt="The photo you picked"><div class="tgb">
+      <p class="lbl">What does this photo show?</p>${g1 ? row(g1, g1.choices) : ''}${g2 ? row(g2, g2opts) : ''}
+      <p class="hint">${!key ? `Pick the ${esc(g1.label.toLowerCase())} shown in the photo.` : typeof photoLib[key] === 'string' ? `This replaces the current <b>${esc(slot?.label || '')}</b> photo.` : `Guests see it when they pick <b>${esc(slot?.label || '')}</b>.`}</p>
+      <div class="btnrow"><button class="btn" id="tagsave" type="button" ${key && !photoBusy.has(key) ? '' : 'disabled'}>${photoBusy.has(key) ? 'Saving…' : 'Save photo'}</button><button class="btn out" id="tagx" type="button">Cancel</button></div></div></div>`;
+  }
+  return `<div class="photos"><h3 class="gtitle">Example photos <span class="hint">${loading ? 'loading…' : `${have.length} added`} · every event uses the same photos</span></h3>
+    ${tagger}
+    <div class="pgrid sm">
+      <label class="ptile addt"><span class="plus" aria-hidden="true">+</span><b>Add photo</b><small>Take or pick one, then tap what it shows</small><input type="file" accept="image/*" data-addphoto="${esc(it.id)}"></label>
+      ${have.map(s => `<figure class="ptile"><div class="pimg"><img src="${esc(photoLib[s.key])}" alt=""></div><figcaption>${esc(s.label)}</figcaption>
+        <div class="acts"><label class="up ${photoBusy.has(s.key) ? 'busy' : ''}">${photoBusy.has(s.key) ? 'Saving…' : 'Replace'}<input type="file" accept="image/*" data-upload="${esc(s.key)}"></label><button class="rm" type="button" data-remove="${esc(s.key)}" aria-label="Remove ${esc(s.label)} photo">×</button></div></figure>`).join('')}
+    </div>
+    ${missing.length ? `<details class="miss"><summary>${missing.length} without a photo</summary><p class="hint">Guests see a drawing for these until a photo is added.</p>
+      <ul>${missing.map(s => `<li><span>${esc(s.label)}</span><label class="up sm ${photoBusy.has(s.key) ? 'busy' : ''}">${photoBusy.has(s.key) ? 'Saving…' : 'Add'}<input type="file" accept="image/*" data-upload="${esc(s.key)}"></label></li>`).join('')}</ul></details>` : ''}</div>`;
+}
+async function savePhoto(key, data, rerender) {
+  photoBusy.add(key); rerender();
+  try { await setDoc(doc(db, 'photos', key), { data, updatedAt: serverTimestamp(), by: user.email }); photoLib[key] = data; toast('Photo saved'); return true; }
+  catch (err) { toast('Could not save that photo: ' + (err.code || err.message)); return false; }
+  finally { photoBusy.delete(key); rerender(); }
+}
+const readPhoto = async f => { try { return await fileToJpeg(f); } catch (e) { toast("Couldn't read that image. Try a JPEG or PNG."); return null; } };
+function bindPhotos(rerender) {
+  document.querySelectorAll('[data-addphoto]').forEach(inp => inp.onchange = async () => {
+    const f = inp.files && inp.files[0]; if (!f) return;
+    const it = pieceDef(inp.dataset.addphoto)?.it; if (!it) return;
+    const data = await readPhoto(f); if (!data) return;
+    if (!it.groups.length) { await savePhoto(it.id, data, rerender); return; }
+    const g1 = it.groups[0], sel = {}; if (g1.choices.length === 1) sel[g1.id] = g1.choices[0].id;
+    photoPend = { item: it.id, data, sel }; rerender();
+    document.getElementById('tagger')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+  document.querySelectorAll('[data-tag]').forEach(b => b.onclick = () => { photoPend.sel[b.dataset.tag] = b.dataset.val; rerender(); });
+  const sv = document.getElementById('tagsave');
+  if (sv) sv.onclick = async () => { const it = pieceDef(photoPend.item).it, key = pendKey(it); if (!key) return; if (await savePhoto(key, photoPend.data, () => {})) { photoPend = null; } rerender(); };
+  const tx = document.getElementById('tagx'); if (tx) tx.onclick = () => { photoPend = null; rerender(); };
+  document.querySelectorAll('[data-upload]').forEach(inp => inp.onchange = async () => {
+    const f = inp.files && inp.files[0]; if (!f) return; const data = await readPhoto(f); if (data) await savePhoto(inp.dataset.upload, data, rerender);
+  });
+  document.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
+    const key = b.dataset.remove, old = photoLib[key];
+    try {
+      await deleteDoc(doc(db, 'photos', key)); photoLib[key] = null; rerender();
+      toast('Photo removed', { label: 'Undo', run: () => setDoc(doc(db, 'photos', key), { data: old, updatedAt: serverTimestamp(), by: user.email }).then(() => { photoLib[key] = old; rerender(); }) });
+    } catch (err) { toast('Could not remove: ' + (err.code || err.message)); }
+  });
+}
+// What a guest sees for one piece at this event. Tapping choices swaps the photo, to check coverage.
+function piecePreview(ev, it) {
+  const d = document.createElement('dialog'); d.className = 'sheet';
+  const o = { item: it.id, opts: firstOpts(ev, it), name: 'Sofia', font: 'script' };
+  const draw = () => {
+    const photo = photoFor(ev, o);
+    d.innerHTML = `<div class="sh-in"><h2><span>what guests <em>see</em></span><button class="close" type="button" data-x aria-label="Close">×</button></h2>
+      <div class="proof"><span class="ph">${previewHTML(ev, o)}</span><b>${esc(it.label)}</b>${it.material ? `<span class="mats">${esc(it.material)}</span>` : ''}
+        <span class="hint">${photo ? 'Showing your photo for these choices.' : 'No photo for these choices yet, so guests see this drawing.'}</span></div>
+      ${it.groups.map(g => `<fieldset><legend>${esc(g.label)}</legend><div class="seg">${choicesFor(ev, it, g).map(c => `<button type="button" data-g="${esc(g.id)}" data-c="${esc(c.id)}" aria-checked="${o.opts[g.id] === c.id}">${esc(c.label)}</button>`).join('')}</div></fieldset>`).join('')}
+      ${offered(ev, it.id) ? '' : '<p class="err">This piece is switched off, so guests won\'t see it at this event.</p>'}</div>`;
+    d.querySelector('[data-x]').onclick = () => { d.close(); d.remove(); };
+    d.querySelectorAll('[data-g]').forEach(b => b.onclick = () => { o.opts[b.dataset.g] = b.dataset.c; draw(); });
+  };
+  d.addEventListener('close', () => d.remove());
+  document.body.appendChild(d); draw(); d.showModal();
+  loadPhotos([it], () => d.isConnected && draw());
+}
+// Adds to the shared catalog right away (from the event's setup page), then returns what fn returns.
+async function catalogAdd(fn) {
+  await loadCatalog(true);
+  const cat = JSON.parse(JSON.stringify(CAT)), r = fn(cat);
+  await setDoc(doc(db, 'config', 'catalog'), { categories: cat.categories, updatedAt: serverTimestamp(), by: user.email });
+  CAT = cat; catLoading = Promise.resolve();
+  return r;
 }
 
 async function setupPage(eventId) {
   $app.innerHTML = staffLoading('Loading event…');
-  let ev = null, others = [];
+  let ev = null, others = [], code = null;
   try { const s = await getDoc(doc(db, 'events', eventId)); ev = s.exists() ? s.data() : null; } catch (e) {}
   if (!ev) { $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap"><h1>event not <em>found</em></h1><p><a href="#/admin">Back to events</a></p></main>`; bindStaffHead(); return; }
   try { others = (await listEvents()).filter(e => e.id !== eventId && e.id !== DEMO_ID).sort(byDateDesc); } catch (e) {}
+  try { const c = await getDoc(doc(db, 'events', eventId, 'private', 'staff')); code = c.exists() ? c.data().code : null; } catch (e) {}
   const st = { name: ev.name || '', date: ev.date || '', open: ev.open !== false, ...setupFrom(ev) };
-  let savedEngravers = [...st.engravers], dirty = false, saving = false, savedName = st.name;
+  let savedEngravers = [...st.engravers], dirty = false, saving = false, savedName = st.name, locked = !!ev.managersOnly;
+  const nav = { ci: null, ii: null }; // where the "what's offered" list is drilled to
   const url = guestUrl(eventId);
   const legacy = Object.keys(ev.photos || {}).length;
+  const isDemo = eventId === DEMO_ID;
   leaveGuard = () => dirty;
+  if (CAT.categories.length === 1) nav.ci = 0;
 
+  const shown = () => ({ ...ev, items: st.items, hidden: st.hidden });
+  const thumb = it => previewHTML(shown(), { item: it.id, opts: firstOpts(shown(), it) }, false);
+  const sw = (attrs, on, label) => `<label class="switch"><input type="checkbox" ${attrs} ${on ? 'checked' : ''} aria-label="${esc(label)}"><span aria-hidden="true"></span></label>`;
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
   const chipsHTML = () => st.engravers.map((e, i) => `<span>${esc(e)}<button type="button" data-rm="${i}" aria-label="Remove ${esc(e)}">×</button></span>`).join('') || '<em class="note">No engravers yet.</em>';
-  const pieceRow = it => {
+
+  function offerHTML() {
+    const c = nav.ci != null ? CAT.categories[nav.ci] : null, it = c && nav.ii != null ? c.items[nav.ii] : null;
+    const crumbs = `<nav class="crumbs" aria-label="Where you are"><button type="button" data-nav="root">All categories</button>${c ? `<i>/</i>${it ? `<button type="button" data-nav="cat">${esc(c.label)}</button>` : `<span>${esc(c.label)}</span>`}` : ''}${it ? `<i>/</i><span>${esc(it.label)}</span>` : ''}</nav>`;
+    const head = (title, lvl) => `<div class="ddhd">${crumbs}<div class="ddt"><h2>${title}</h2><span class="lvl">${lvl}</span></div></div>`;
+    if (!c) return head("what's <em>offered</em>", 'Categories') + `<div class="ddl">${CAT.categories.map((c, ci) => {
+        const on = c.items.filter(i => st.items[i.id] === true), first = on[0] || c.items[0];
+        return `<button type="button" class="drow" data-ci="${ci}"><span class="dth">${first ? thumb(first) : ''}</span><span class="dtx"><b>${esc(c.label)}</b><small>${c.items.length ? `${on.length} of ${plural(c.items.length, 'piece')} offered` : 'No pieces yet'}</small></span><span class="chev" aria-hidden="true">›</span></button>`; }).join('')}</div>
+      <p class="hint">Tap a category to choose its pieces, choices and photos for this event.</p>`;
+    if (!it) return head(esc(c.label.toLowerCase()), 'Pieces') + `<div class="ddl">${c.items.map((it, ii) => { const on = st.items[it.id] === true, n = photoCount(it);
+        return `<div class="drow ${on ? '' : 'off'}" data-ii="${ii}" role="button" tabindex="0" aria-label="Open ${esc(it.label)}"><span class="dth">${thumb(it)}</span><span class="dtx"><b>${esc(it.label)}</b><small>${on ? `${plural(n, 'photo')} · ${plural(it.groups.length, 'option')}` : 'Not offered at this event'}</small></span>${sw(`data-item="${esc(it.id)}"`, on, `Offer ${it.label} at this event`)}<span class="chev" aria-hidden="true">›</span></div>`; }).join('') || '<p class="hint" style="padding:12px 0">No pieces here yet. Add the first one below.</p>'}</div>
+      <div class="addrow"><label class="vh" for="np">New piece name</label><input id="np" placeholder="New piece, e.g. Wine glass" autocapitalize="words"><button class="btn out" id="addp" type="button">Add</button></div>
+      <p class="hint">Switch a piece on or off for this event, or tap it to set its choices and photos. New pieces are added to the catalog and turned on here.</p>`;
     const on = st.items[it.id] === true;
-    const shown = { ...ev, items: st.items, hidden: st.hidden };
-    return `<div class="prow ${on ? 'on' : ''}"><label class="ptop"><span class="ph">${previewHTML(shown, { item: it.id, opts: firstOpts(shown, it) }, false)}</span>
-      <span class="pn"><span><input type="checkbox" data-item="${esc(it.id)}" ${on ? 'checked' : ''}> <b>${esc(it.label)}</b></span><small>${on ? (it.groups.length ? 'Tap a choice to turn it off for this event.' : 'No options; guests just add a name.') : 'Not offered at this event'}</small></span></label>
-      ${on ? it.groups.map(g => `<div class="cgrp"><span class="gl">${esc(g.label)}</span><div class="cchips">${g.choices.map(c => { const path = `${it.id}/${g.id}/${c.id}`, off = st.hidden[path] === true;
-        return `<button type="button" class="cc" aria-pressed="${!off}" data-ch="${esc(path)}">${g.swatch ? `<i style="background:${esc(c.color || SWATCH[c.id] || '#ccc')}"></i>` : ''}${esc(c.label)}</button>`; }).join('')}</div></div>`).join('') : ''}</div>`;
-  };
+    return head(esc(it.label.toLowerCase()), 'Piece') + `
+      <div class="ddbar">${sw(`data-item="${esc(it.id)}"`, on, `Offer ${it.label} at this event`)}<span><b>${on ? 'Offered at this event' : 'Not offered at this event'}</b></span><button class="btn out" id="pv" type="button">Preview</button></div>
+      ${photoPanelHTML(it)}
+      <h3 class="gtitle">Choices <span class="hint">tap one to turn it off for this event</span></h3>
+      ${it.groups.map((g, gi) => `<div class="cgrp2"><span class="gl">${esc(g.label)}</span><div class="cchips">${g.choices.map(x => { const path = `${it.id}/${g.id}/${x.id}`, off = st.hidden[path] === true;
+          return `<button type="button" class="cc" aria-pressed="${!off}" data-ch="${esc(path)}">${g.swatch ? `<i style="background:${esc(x.color || SWATCH[x.id] || '#ccc')}"></i>` : ''}${esc(x.label)}</button>`; }).join('')}</div>
+        <div class="addrow sm"><label class="vh" for="nc${gi}">New ${esc(g.label)} choice</label><input id="nc${gi}" data-newch="${gi}" placeholder="Add a ${esc(g.label.toLowerCase())}" autocapitalize="words"><button class="btn out" type="button" data-addch="${gi}">Add</button></div></div>`).join('')
+        || '<p class="hint">No options: guests pick this piece and add a name.</p>'}
+      <p class="hint">New choices go in the catalog, so other events offering this piece get them too. Rename, reorder or add option groups in the <a href="#/catalog">catalog</a>.</p>`;
+  }
 
   function render() {
+    const y = scrollY;
     $app.innerHTML = `${staffHead('event setup', 'setup')}<main class="wrap setup">
       <a class="backlink" href="#/admin">‹ All events</a>
       <h1>${esc(savedName)}</h1>
       <div class="btnrow"><a class="btn" href="#/board/${encodeURIComponent(eventId)}">Open board</a><a class="btn out" href="#/e/${encodeURIComponent(eventId)}">Preview guest form</a></div>
-      ${others.length ? `<section class="card"><h2>copy from another event</h2><p class="hint">Brings over engravers, pickup spot, and pieces and choices. Name, date, and orders stay as they are. Nothing saves until you tap Save.</p>
-        <div class="addrow"><label class="vh" for="cp-from">Event to copy</label><select id="cp-from">${others.map(e => `<option value="${esc(e.id)}">${esc(e.name)} · ${esc(fmtDate(e.date))}</option>`).join('')}</select><button class="btn out" id="cp" type="button">Copy</button></div></section>` : ''}
+      <button class="bigbtn main" id="tpl" type="button"><span class="bi" aria-hidden="true">⧉</span><span><b>Reuse an event template</b><small>Fill this event from a past one: engravers, pickup spot, pieces and choices. Nothing saves until you tap Save.</small></span></button>
       <section class="card"><h2>details</h2>
         <div class="field"><label class="lbl" for="s-name">Event name</label><input id="s-name" value="${esc(st.name)}"></div>
         <div class="field"><label class="lbl" for="s-date">Date</label><input id="s-date" type="date" value="${esc(st.date)}"></div>
         <div class="field"><label class="lbl" for="s-pick">Where guests pick up (finishes "pick it up …")</label><input id="s-pick" value="${esc(st.pickupNote)}"></div>
         <label class="tog"><input type="checkbox" id="s-open" ${st.open ? 'checked' : ''}> Taking orders <small>Turn off to close the guest form. Pieces already ordered still show on the board.</small></label></section>
+      <section class="card dd" id="offer">${offerHTML()}</section>
       <section class="card"><h2>engravers</h2><p class="hint">Each engraver gets a lane on the board.</p>
         <div class="chips" id="chips">${chipsHTML()}</div>
         <div class="addrow"><label class="vh" for="s-eng">Add an engraver</label><input id="s-eng" placeholder="Name" autocapitalize="words"><button class="btn out" id="addeng" type="button">Add</button></div></section>
-      <section class="card"><h2>pieces &amp; choices</h2><p class="hint">Check the pieces this event offers, then tap any choice to switch it off here only. To add pieces or choices, edit the <a href="#/catalog">catalog</a>.</p>
-        ${CAT.categories.filter(c => c.items.length).map(c => `<h3 class="cathead">${esc(c.label)}</h3>${c.items.map(pieceRow).join('')}`).join('') || '<p class="note">The catalog is empty.</p>'}</section>
+      ${isDemo ? '' : `<section class="card"><h2>event staff</h2>
+        <p class="hint">Staff open the app, tap <b>Event staff</b>, and type this code. No Google account. It opens this event's board only. These two settings save right away.</p>
+        <div class="codebox">${code ? `<span class="code" aria-label="Staff code ${esc(code.split('').join(' '))}">${esc(code)}</span>
+          <div class="btnrow"><button class="btn out" id="cpcode" type="button">Copy code</button><button class="btn out" id="newcode" type="button">New code</button></div>`
+          : '<p class="note" style="text-align:left">No staff code yet.</p><button class="btn" id="newcode" type="button">Make a staff code</button>'}</div>
+        <p class="hint">New code signs everyone out who used the old one.</p>
+        <label class="switchrow"><span><b>Managers only</b><small>Closes this event's board and queue to everyone except Steph (hello@stephivelisse.com) and DeVaughn. Staff on the board get signed out of it right away.</small></span>${sw('id="s-lock"', locked, 'Managers only')}</label></section>`}
       <section class="card"><h2>guest link &amp; QR</h2>
         <div class="share"><div class="qr" aria-label="QR code for the guest form">${qrSvg(url)}</div>
           <div class="shareinfo"><div class="url">${esc(url)}</div><div class="btnrow"><button class="btn out" id="copy" type="button">Copy link</button><button class="btn out" id="dlqr" type="button">Download QR to print</button></div></div></div></section>
@@ -842,9 +1097,14 @@ async function setupPage(eventId) {
         ${legacy ? `<p class="hint" style="margin-top:14px">This event still has ${legacy} photo link${legacy === 1 ? '' : 's'} from the old setup, which override the photo library.</p><button class="linkbtn" id="clearlegacy" type="button">Remove old photo links</button>` : ''}</section>
     </main>
     <div class="savebar"><span id="dirty">${dirty ? 'Unsaved changes' : 'All changes saved'}</span><button class="btn" id="save" type="button" ${dirty ? '' : 'disabled'}>Save</button></div>`;
-    bind();
+    bind(); scrollTo(0, y);
+    const c = nav.ci != null ? CAT.categories[nav.ci] : null;
+    loadPhotos(c ? (nav.ii != null ? [c.items[nav.ii]] : c.items) : [], redraw);
   }
+  // Photos arrive after the page draws; don't redraw under someone typing.
+  const redraw = () => { if (document.activeElement?.matches('input:not([type=checkbox]):not([type=file]),textarea')) return; render(); };
   const markDirty = () => { dirty = true; document.getElementById('dirty').textContent = 'Unsaved changes'; document.getElementById('save').disabled = false; };
+  const goOffer = () => { const o = document.getElementById('offer'); if (o && o.getBoundingClientRect().top < 0) o.scrollIntoView({ block: 'start' }); };
   function bind() {
     bindStaffHead();
     const bindChips = () => document.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { st.engravers.splice(+b.dataset.rm, 1); document.getElementById('chips').innerHTML = chipsHTML(); bindChips(); markDirty(); });
@@ -859,10 +1119,63 @@ async function setupPage(eventId) {
     engIn.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addEng(); } };
     [['s-name', 'name'], ['s-date', 'date'], ['s-pick', 'pickupNote']].forEach(([id, k]) => document.getElementById(id).oninput = e => { st[k] = e.target.value; markDirty(); });
     document.getElementById('s-open').onchange = e => { st.open = e.target.checked; markDirty(); };
+    document.getElementById('tpl').onclick = async () => {
+      const r = await eventSheet({ title: 'reuse an event <em>template</em>', events: others, details: false }); if (!r) return;
+      Object.assign(st, setupFrom(r.src)); dirty = true; render(); toast(`Copied from ${r.src.name}. Review it, then tap Save.`);
+    };
+
+    // what's offered: drill-down
+    document.querySelectorAll('[data-nav]').forEach(b => b.onclick = () => { if (b.dataset.nav === 'root') { nav.ci = null; nav.ii = null; } else nav.ii = null; photoPend = null; render(); goOffer(); });
+    document.querySelectorAll('[data-ci]').forEach(b => b.onclick = () => { nav.ci = +b.dataset.ci; nav.ii = null; render(); goOffer(); });
+    document.querySelectorAll('.drow[data-ii]').forEach(r => {
+      const open = () => { nav.ii = +r.dataset.ii; photoPend = null; render(); goOffer(); };
+      r.onclick = e => { if (!e.target.closest('.switch')) open(); };
+      r.onkeydown = e => { if ((e.key === 'Enter' || e.key === ' ') && !e.target.closest('.switch')) { e.preventDefault(); open(); } };
+    });
     document.querySelectorAll('[data-item]').forEach(c => c.onchange = () => { st.items[c.dataset.item] = c.checked; dirty = true; render(); });
     document.querySelectorAll('[data-ch]').forEach(b => b.onclick = () => { const p = b.dataset.ch; if (st.hidden[p]) delete st.hidden[p]; else st.hidden[p] = true; b.setAttribute('aria-pressed', String(!st.hidden[p])); markDirty(); });
-    const cp = document.getElementById('cp');
-    if (cp) cp.onclick = () => { const src = others.find(e => e.id === document.getElementById('cp-from').value); if (!src) return; Object.assign(st, setupFrom(src)); dirty = true; render(); toast(`Copied setup from ${src.name}. Review it, then Save.`); };
+    const pv = document.getElementById('pv');
+    if (pv) pv.onclick = () => piecePreview(shown(), CAT.categories[nav.ci].items[nav.ii]);
+    const np = document.getElementById('np');
+    const addPiece = async () => {
+      const label = np.value.trim(); if (!label) { np.focus(); return; }
+      const catId = CAT.categories[nav.ci].id;
+      if (CAT.categories[nav.ci].items.some(i => i.label.toLowerCase() === label.toLowerCase())) { toast(`${label} is already here`); return; }
+      document.getElementById('addp').disabled = true;
+      try {
+        const id = await catalogAdd(cat => { const c = cat.categories.find(x => x.id === catId); const id = uniqId(label, new Set(cat.categories.flatMap(x => x.items.map(i => i.id))), 'piece');
+          c.items.push({ id, label, material: '', preview: 'card', groups: [] }); return id; });
+        st.items[id] = true; dirty = true; nav.ci = CAT.categories.findIndex(x => x.id === catId); nav.ii = CAT.categories[nav.ci].items.findIndex(i => i.id === id);
+        render(); goOffer(); toast(`${label} added and turned on. Tap Save to keep it on for this event.`);
+      } catch (err) { toast('Could not add: ' + (err.code || err.message)); document.getElementById('addp').disabled = false; }
+    };
+    if (np) { document.getElementById('addp').onclick = addPiece; np.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addPiece(); } }; }
+    const addChoice = async gi => {
+      const inp = document.querySelector(`[data-newch="${gi}"]`), label = inp.value.trim(); if (!label) { inp.focus(); return; }
+      const it = CAT.categories[nav.ci].items[nav.ii], g = it.groups[gi];
+      if (g.choices.some(x => x.label.toLowerCase() === label.toLowerCase())) { toast(`${label} is already there`); return; }
+      try {
+        await catalogAdd(cat => { const gg = cat.categories.flatMap(c => c.items).find(i => i.id === it.id).groups.find(x => x.id === g.id);
+          gg.choices.push({ id: uniqId(label, new Set(gg.choices.map(x => x.id)), 'choice'), label, ...(gg.swatch ? { color: '#cccccc' } : {}) }); });
+        render(); toast(`${label} added${g.swatch ? '. Set its color in the catalog.' : ''}`);
+        document.querySelector(`[data-newch="${gi}"]`)?.focus();
+      } catch (err) { toast('Could not add: ' + (err.code || err.message)); }
+    };
+    document.querySelectorAll('[data-addch]').forEach(b => b.onclick = () => addChoice(b.dataset.addch));
+    document.querySelectorAll('[data-newch]').forEach(i => i.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); addChoice(i.dataset.newch); } });
+    bindPhotos(render);
+
+    // event staff
+    const cpc = document.getElementById('cpcode');
+    if (cpc) cpc.onclick = () => (navigator.clipboard?.writeText(code) || Promise.reject()).then(() => toast('Staff code copied')).catch(() => toast(code));
+    const nc = document.getElementById('newcode');
+    if (nc) nc.onclick = async () => {
+      if (code && !confirm('Make a new staff code? Everyone using the old code loses the board until they type the new one.')) return;
+      nc.disabled = true; try { code = await setStaffCode(eventId, code); render(); toast('New staff code ready'); } catch (err) { nc.disabled = false; toast('Could not make a code: ' + (err.code || err.message)); }
+    };
+    const lk = document.getElementById('s-lock');
+    if (lk) lk.onchange = async () => { lk.disabled = true; if (await setManagersOnly(eventId, lk.checked)) locked = lk.checked; else lk.checked = locked; lk.disabled = false; };
+
     document.getElementById('copy').onclick = () => (navigator.clipboard?.writeText(url) || Promise.reject()).then(() => toast('Guest link copied')).catch(() => toast(url));
     document.getElementById('dlqr').onclick = () => downloadQr(url, eventId);
     document.getElementById('export').onclick = async () => { try { await exportOrders(eventId, ev); } catch (err) { toast('Export failed: ' + (err.code || err.message)); } };
@@ -894,7 +1207,7 @@ async function setupPage(eventId) {
   }
   const leave = e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } };
   addEventListener('beforeunload', leave); unsubs.push(() => removeEventListener('beforeunload', leave));
-  photoRerender = render;
+  photoRerender = redraw;
   render();
 }
 
@@ -1048,45 +1361,24 @@ function photoSlots(it) {
       ...g2.choices.filter(c => c.id !== 'none').map(c2 => ({ key: `${it.id}_${c1.id}_${c2.id}`, opts: { [g1.id]: c1.id, [g2.id]: c2.id }, label: `${c1.label} · ${c2.label.toLowerCase()}` }))];
   });
 }
+// Every piece's photos in one place, using the same add-then-tag flow as event setup.
 async function photosPage() {
   $app.innerHTML = staffLoading('Loading photos…');
   await loadCatalog(true);
-  const pieces = allPieces().map(p => ({ ...p, slots: photoSlots(p.it).map(s => ({ ...s, item: p.it.id })) }));
-  const slots = pieces.flatMap(p => p.slots);
-  await Promise.all(slots.map(s => getDoc(doc(db, 'photos', s.key)).then(d => { photoLib[s.key] = d.exists() ? (d.data().data || null) : null; }).catch(() => {})));
-  const busy = new Set();
-  const drawn = s => { const p = pieceDef(s.item), sg = p.it.groups.find(g => g.swatch), ch = sg && sg.choices.find(c => c.id === s.opts[sg.id]);
-    return window.EngravePreview.renderPreview({ item: p.it.preview || 'card', color: sg ? s.opts[sg.id] : undefined, hex: ch?.color, addon: Object.values(s.opts).find(v => v === 'stars' || v === 'heart') || 'none', name: '', font: 'script' }); };
-  const tile = s => {
-    const has = typeof photoLib[s.key] === 'string', up = busy.has(s.key);
-    return `<figure class="ptile" data-key="${esc(s.key)}"><div class="pimg ${has ? '' : 'none'}">${has ? `<img src="${esc(photoLib[s.key])}" alt="">` : drawn(s)}${has ? '' : '<span class="tag">no photo yet</span>'}</div>
-      <figcaption>${esc(s.label)}</figcaption><div class="acts"><label class="up ${up ? 'busy' : ''}">${up ? 'Uploading…' : has ? 'Replace' : 'Add photo'}<input type="file" accept="image/*" data-upload="${esc(s.key)}" ${up ? 'disabled' : ''}></label>
-      ${has && !up ? `<button class="rm" type="button" data-remove="${esc(s.key)}" aria-label="Remove photo">×</button>` : ''}</div></figure>`;
-  };
+  let open = null;
   function render() {
-    const y = scrollY, n = slots.filter(s => typeof photoLib[s.key] === 'string').length;
+    const y = scrollY, pieces = allPieces();
     $app.innerHTML = `${staffHead('photos', 'photos')}<main class="wrap"><h1>example <em>photos</em></h1>
-      <p class="hint">${n} of ${slots.length} added. Guests see these as they choose; without one they see a drawn preview. Every event uses this library. Shoot in portrait with the piece centered. Pieces and choices come from the <a href="#/catalog">catalog</a>.</p>
-      ${pieces.map(p => `<h2 class="sec">${esc(p.it.label.toLowerCase())} <small>${esc(p.cat.label)}</small></h2><div class="pgrid">${p.slots.map(tile).join('')}</div>`).join('') || '<p class="note">The catalog has no pieces yet.</p>'}</main>`;
+      <p class="hint">Guests see these as they choose. Every event uses the same photos. Tap <b>Add photo</b>, pick or take one, then tap what it shows. Shoot in portrait with the piece centered.</p>
+      <div class="card dd"><div class="ddl">${pieces.map(({ cat, it }) => { const n = photoCount(it), all = photoSlots(it).length, isOpen = open === it.id;
+        return `<button type="button" class="drow" data-open="${esc(it.id)}" aria-expanded="${isOpen}"><span class="dth">${previewHTML(null, { item: it.id, opts: firstOpts(null, it) }, false)}</span><span class="dtx"><b>${esc(it.label)}</b><small>${esc(cat.label)} · ${n} of ${all} photo${all === 1 ? '' : 's'}</small></span><span class="chev ${isOpen ? 'down' : ''}" aria-hidden="true">›</span></button>
+          ${isOpen ? `<div class="dopen">${photoPanelHTML(it)}</div>` : ''}`; }).join('') || '<p class="note">The catalog has no pieces yet.</p>'}</div></div></main>`;
     bindStaffHead(); scrollTo(0, y);
-    document.querySelectorAll('[data-upload]').forEach(inp => inp.onchange = async () => {
-      const f = inp.files && inp.files[0]; if (!f) return; const key = inp.dataset.upload;
-      busy.add(key); render();
-      try {
-        const data = await fileToJpeg(f);
-        await setDoc(doc(db, 'photos', key), { data, updatedAt: serverTimestamp(), by: user.email });
-        photoLib[key] = data; toast('Photo saved');
-      } catch (err) { toast('Could not save that photo: ' + (err.code || err.message || 'unreadable image')); }
-      finally { busy.delete(key); render(); }
-    });
-    document.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
-      const key = b.dataset.remove, old = photoLib[key];
-      try {
-        await deleteDoc(doc(db, 'photos', key)); photoLib[key] = null; render();
-        toast('Photo removed', { label: 'Undo', run: () => setDoc(doc(db, 'photos', key), { data: old, updatedAt: serverTimestamp(), by: user.email }).then(() => { photoLib[key] = old; render(); }) });
-      } catch (err) { toast('Could not remove: ' + (err.code || err.message)); }
-    });
+    document.querySelectorAll('[data-open]').forEach(b => b.onclick = () => { open = open === b.dataset.open ? null : b.dataset.open; photoPend = null; render(); });
+    bindPhotos(render);
   }
+  photoRerender = render;
+  loadPhotos(allPieces().map(p => p.it), render);
   render();
 }
 
